@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aegis-update-metadata
+  namespace: aegis
+spec:
+  timeZone: "Asia/Shanghai"
+  schedule: "0 2 * * *" # 每天凌晨 2 点执行
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+          - name: update-metadata
+            image: aegis/ops-service-metadata-updater:0.1.0
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: PROMETHEUS_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: aegis-config
+                  key: PROMETHEUS_BASE_URL
+            - name: CONFIG_MAP_NAME
+              value: "aegis-metadata"
+            - name: CONFIG_MAP_NAMESPACE
+              value: "aegis"
+          serviceAccountName: ops-service-sa
+          restartPolicy: OnFailure

@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: aegis-daily-patrol
+  namespace: aegis
+spec:
+  timeZone: "Asia/Shanghai" # 明确指定时区为北京时间
+  schedule: "0 8 * * *" # 每天早上 8 点执行
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+          - name: patrol-trigger
+            image: 192.169.223.141/monitoring/curl:8.5.0
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            - |
+              curl -v -X POST http://ops-service.aegis:8002/api/ops/analyze \
+              -H "Content-Type: application/json" \
+              -d '{"description": "请执行每日巡检技能，检查集群健康状态。请务必严格遵守 skill 文档中规定的报告输出格式。", "session_id": "daily-patrol-bot", "model": "doubao", "notify_chat_id": "default"}'
+          restartPolicy: OnFailure
