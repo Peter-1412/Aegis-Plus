@@ -44,7 +44,33 @@ export type AgentMessage = {
   id: number;
   role: "USER" | "AGENT";
   content: string;
+  metadata?: string | null;
   createdAt: string;
+};
+
+export type AgentStep = {
+  id: string;
+  type: "thought" | "tool";
+  content: string;
+  toolInput?: string;
+  toolOutput?: string;
+  status: "pending" | "success" | "error";
+};
+
+export type AgentRootCause = {
+  rank: number;
+  description: string;
+  probability?: number;
+  service?: string;
+};
+
+export type AgentStructuredMessage = {
+  version?: number;
+  content?: string;
+  summary?: string;
+  ranked_root_causes?: AgentRootCause[];
+  next_actions?: string[];
+  steps?: AgentStep[] | unknown[];
 };
 
 export type DashboardOverview = {

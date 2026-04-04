@@ -27,6 +27,9 @@ class OpsStreamHandler(AsyncCallbackHandler):
         self.step_counter = 0
         self.current_workflow_stage = "thinking"
         self.current_step_id: str | None = None
+        self.pending_tool_step_id: str | None = None
+        self.pending_tool_name: str | None = None
+        self.pending_tool_input: str | None = None
 
     def _next_step_id(self) -> str:
         self.step_counter += 1
@@ -42,6 +45,17 @@ class OpsStreamHandler(AsyncCallbackHandler):
         }
         payload.update(data)
         await self.queue.put(payload)
+
+    async def emit_agent_thought(self, thought: str):
+        self.current_workflow_stage = "planning"
+        thought_step_id = self._next_step_id()
+        await self._send_event(
+            "agent_thought",
+            {
+                "thought": thought,
+                "step_id": thought_step_id,
+            },
+        )
 
     async def on_llm_start(self, serialized, prompts, **kwargs):
         self.current_workflow_stage = "thinking"
@@ -93,27 +107,12 @@ class OpsStreamHandler(AsyncCallbackHandler):
         log = getattr(action, "log", None)
         thought = str(log) if log else None
         if thought:
-            self.current_workflow_stage = "planning"
-            self.current_step_id = self._next_step_id()
-            await self._send_event(
-                "agent_thought",
-                {
-                    "thought": thought,
-                    "step_id": self.current_step_id,
-                },
-            )
+            await self.emit_agent_thought(thought)
         self.current_workflow_stage = "executing"
-        if not self.current_step_id:
-            self.current_step_id = self._next_step_id()
-        await self._send_event(
-            "agent_action",
-            {
-                "tool": str(tool),
-                "tool_input": _stringify(tool_input),
-                "log": str(log) if log else None,
-                "step_id": self.current_step_id,
-            },
-        )
+        self.pending_tool_step_id = self._next_step_id()
+        self.pending_tool_name = str(tool)
+        self.pending_tool_input = _stringify(tool_input)
+        self.current_step_id = self.pending_tool_step_id
 
     async def on_tool_start(self, serialized, input_str, **kwargs):
         name = None
@@ -122,33 +121,32 @@ class OpsStreamHandler(AsyncCallbackHandler):
         if not name:
             name = str(serialized)
         self.current_workflow_stage = "executing"
-        self.current_step_id = self._next_step_id()
+        step_id = self.pending_tool_step_id or self._next_step_id()
+        tool_input = self.pending_tool_input or _stringify(input_str)
+        self.current_step_id = step_id
         await self._send_event(
             "tool_start",
             {
-                "tool": name,
-                "tool_input": _stringify(input_str),
-                "step_id": self.current_step_id,
+                "tool": self.pending_tool_name or name,
+                "tool_input": tool_input,
+                "step_id": step_id,
             },
         )
 
     async def on_tool_end(self, output, **kwargs):
         self.current_workflow_stage = "observing"
         observation = _stringify(output)
+        step_id = self.current_step_id or self.pending_tool_step_id
         await self._send_event(
             "tool_end",
             {
                 "observation": observation,
-                "step_id": self.current_step_id,
+                "step_id": step_id,
             },
         )
-        await self._send_event(
-            "agent_observation",
-            {
-                "observation": observation,
-                "step_id": self.current_step_id,
-            },
-        )
+        self.pending_tool_step_id = None
+        self.pending_tool_name = None
+        self.pending_tool_input = None
 
     async def on_chain_error(self, error, **kwargs):
         await self._send_event(

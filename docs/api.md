@@ -114,18 +114,16 @@ Aegis 对外提供的用于分析 K8s 集群状态的核心入口。
     "sessionId": 1  // 可选，如果提供则追加到历史会话中
   }
   ```
-- **说明**：提供给前端的流式接口，采用 NDJSON (Newline Delimited JSON) 格式。除了包含 LLM 的 token，还会包含 Agent 的完整工具调用和思考过程。
+- **说明**：提供给前端的流式接口，采用 NDJSON (Newline Delimited JSON) 格式。工具调用和思考过程会先行输出，最终回答会以同一条 assistant 消息的增量片段持续追加，适合做类似 Trae/Cursor 的单时间线体验。
 
 ### 响应事件类型
 
 - `start`：分析开始事件
-- `llm_start` / `llm_token` / `llm_end`：LLM 调用过程
 - `agent_thought`：Agent 思考过程（规划阶段）
-- `agent_action`：执行某个工具
 - `tool_start` / `tool_end`：具体工具调用前后
-- `agent_observation`：Agent 对工具返回结果的观察
+- `assistant_message_start` / `assistant_message_delta` / `assistant_message_end`：最终回答消息的开始、增量文本、结束
 - `error`：流程中发生错误
-- `final`：最终运维分析结果（结构同 `/api/ops/analyze`，附加事件字段）
+- `final`：最终运维分析结果，包含结构化字段、标准化步骤列表以及完整 `content`
 - `end`：整个流式会话结束
 
 客户端只需逐行读取并解析 JSON，根据 `event` 字段进行 UI 更新。
@@ -326,13 +324,11 @@ This endpoint has the same request body as `/api/ops/analyze`, but returns multi
 ### Response Event Types
 
 - `start`: Analysis start event
-- `llm_start` / `llm_token` / `llm_end`: LLM invocation process
 - `agent_thought`: Agent thinking process (planning phase)
-- `agent_action`: Executing a specific tool
 - `tool_start` / `tool_end`: Before and after specific tool invocation
-- `agent_observation`: Agent's observation of tool return results
+- `assistant_message_start` / `assistant_message_delta` / `assistant_message_end`: Start, delta chunks and completion of the visible assistant reply
 - `error`: Error occurred during the process
-- `final`: Final ops analysis result (structure same as `/api/ops/analyze`, with additional event fields)
+- `final`: Final ops analysis result with normalized steps and rendered `content`
 - `end`: End of the entire streaming session
 
 Clients should read line by line and parse JSON, updating the UI based on the `event` field.

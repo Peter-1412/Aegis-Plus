@@ -1,12 +1,11 @@
 import asyncio
 import json
 import logging
-import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select
 from pydantic import BaseModel
@@ -15,6 +14,7 @@ from app.db.session import get_session
 from app.db.models import AgentSession, AgentMessage, User
 from app.api.deps import get_current_user
 from app.agent.ops_agent import ensure_cst
+from app.agent.llm import stream_rendered_answer
 from app.models import OpsRequest, TimeRange
 from app.agent.shared import ops_agent, OpsStreamHandler, _request_id_var
 
@@ -22,6 +22,55 @@ router = APIRouter()
 
 def utf8_slice(s: str, length: int) -> str:
     return s[:length] + "..." if len(s) > length else s
+
+
+def build_rendered_content(summary: str, ranked_root_causes: list[dict], next_actions: list[str]) -> str:
+    parts = ["分析结论", summary.strip() or "暂无结论。"]
+
+    if ranked_root_causes:
+        lines = ["", "根因排查候选"]
+        for idx, cause in enumerate(ranked_root_causes, start=1):
+            description = str(cause.get("description") or "").strip()
+            probability = cause.get("probability")
+            confidence = ""
+            if isinstance(probability, (int, float)):
+                confidence = f" (置信度 {(float(probability) * 100):.0f}%)"
+            service = str(cause.get("service") or "").strip()
+            service_suffix = f" [{service}]" if service else ""
+            lines.append(f"{idx}. {description}{service_suffix}{confidence}")
+        parts.extend(lines)
+
+    if next_actions:
+        parts.extend(["", "后续建议"])
+        parts.extend([f"- {str(action).strip()}" for action in next_actions if str(action).strip()])
+
+    return "\n".join(parts).strip()
+
+
+def iter_text_chunks(text: str, chunk_size: int = 24):
+    if not text:
+        return
+    for idx in range(0, len(text), chunk_size):
+        yield text[idx : idx + chunk_size]
+
+
+def build_render_prompt(summary: str, ranked_root_causes: list[dict], next_actions: list[str]) -> str:
+    payload = {
+        "summary": summary,
+        "ranked_root_causes": ranked_root_causes,
+        "next_actions": next_actions,
+    }
+    payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    return (
+        "你是一个智能运维助手。请把下面这份结构化排查结果改写成给用户直接展示的自然语言答复。\n"
+        "要求：\n"
+        "1. 使用中文。\n"
+        "2. 先给出明确结论，再给出根因候选和后续建议。\n"
+        "3. 不要输出 JSON，不要输出 Markdown 代码块。\n"
+        "4. 语气专业、简洁、可执行。\n"
+        "5. 如果有多个根因候选，按可能性从高到低描述。\n\n"
+        f"结构化结果：\n{payload_text}\n"
+    )
 
 @router.get("/sessions")
 def get_sessions(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -162,13 +211,11 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
     queue: asyncio.Queue = asyncio.Queue()
     req_id = _request_id_var.get() or str(uuid.uuid4())
     
-    # Store things that need to be saved at the end
-    steps_accumulator = []
-    
     async def runner():
         try:
             token = _request_id_var.set(req_id)
             handler = OpsStreamHandler(queue)
+            assistant_message_id = f"assistant-{req_id}"
             
             now = datetime.now(timezone(timedelta(hours=8)))
             ops_req = OpsRequest(
@@ -187,16 +234,59 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
                 "request_id": req_id,
             })
             
-            t0 = time.monotonic()
             res = await ops_agent.analyze(ops_req, callbacks=[handler])
-            dt = time.monotonic() - t0
+
+            ranked_root_causes = [c.model_dump() for c in res.ranked_root_causes]
+            next_actions = res.next_actions
+            fallback_content = build_rendered_content(
+                res.summary,
+                ranked_root_causes,
+                next_actions,
+            )
+
+            await queue.put({
+                "event": "assistant_message_start",
+                "message_id": assistant_message_id,
+                "request_id": req_id,
+            })
+
+            try:
+                rendered_content = await stream_rendered_answer(
+                    ops_req.model,
+                    build_render_prompt(res.summary, ranked_root_causes, next_actions),
+                    lambda token: queue.put({
+                        "event": "assistant_message_delta",
+                        "message_id": assistant_message_id,
+                        "delta": token,
+                        "request_id": req_id,
+                    }),
+                )
+            except Exception as render_exc:
+                logging.exception("render stream error: %s", render_exc)
+                rendered_content = fallback_content
+                for chunk in iter_text_chunks(rendered_content):
+                    await queue.put({
+                        "event": "assistant_message_delta",
+                        "message_id": assistant_message_id,
+                        "delta": chunk,
+                        "request_id": req_id,
+                    })
+
+            await queue.put({
+                "event": "assistant_message_end",
+                "message_id": assistant_message_id,
+                "content": rendered_content,
+                "request_id": req_id,
+            })
             
             meta = {
                 "event": "final",
                 "summary": res.summary,
-                "ranked_root_causes": [c.model_dump() for c in res.ranked_root_causes],
-                "next_actions": res.next_actions,
+                "ranked_root_causes": ranked_root_causes,
+                "next_actions": next_actions,
                 "trace": res.trace.model_dump() if res.trace else None,
+                "message_id": assistant_message_id,
+                "content": rendered_content,
                 "request_id": req_id,
             }
             await queue.put(meta)
@@ -214,31 +304,72 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
     asyncio.create_task(runner())
 
     async def iterator() -> AsyncIterator[bytes]:
-        agent_content = ""
+        step_map: dict[str, dict] = {}
+        step_order: list[str] = []
+
+        def upsert_step(item: dict):
+            event_type = item.get("event")
+            step_id = item.get("step_id")
+            if not step_id:
+                return
+            if event_type == "agent_thought":
+                if step_id not in step_map:
+                    step_order.append(step_id)
+                step_map[step_id] = {
+                    "id": step_id,
+                    "type": "thought",
+                    "content": item.get("thought") or "",
+                    "status": "success",
+                }
+            elif event_type == "tool_start":
+                if step_id not in step_map:
+                    step_order.append(step_id)
+                step_map[step_id] = {
+                    "id": step_id,
+                    "type": "tool",
+                    "content": item.get("tool") or "",
+                    "toolInput": item.get("tool_input") or "",
+                    "toolOutput": "",
+                    "status": "pending",
+                }
+            elif event_type == "tool_end":
+                step = step_map.get(step_id)
+                if step:
+                    step["toolOutput"] = item.get("observation") or ""
+                    step["status"] = "success"
+            elif event_type == "error":
+                step = step_map.get(step_id)
+                if step:
+                    step["toolOutput"] = item.get("error_message") or item.get("message") or ""
+                    step["status"] = "error"
+
         while True:
             item = await queue.get()
-            
             event_type = item.get("event")
-            if event_type in ["agent_thought", "agent_action", "tool_start", "tool_end", "agent_observation", "error"]:
-                steps_accumulator.append(item)
-                
+            if event_type in ["agent_thought", "tool_start", "tool_end", "error"]:
+                upsert_step(item)
+
             if event_type == "final":
-                agent_content = item.get("summary", "")
+                ranked_root_causes = item.get("ranked_root_causes") or []
+                next_actions = item.get("next_actions") or []
+                steps = [step_map[step_id] for step_id in step_order if step_id in step_map]
                 structured_content = {
+                    "version": 2,
+                    "content": item.get("content") or "",
                     "summary": item.get("summary"),
-                    "ranked_root_causes": item.get("ranked_root_causes"),
-                    "next_actions": item.get("next_actions"),
-                    "steps": steps_accumulator
+                    "ranked_root_causes": ranked_root_causes,
+                    "next_actions": next_actions,
+                    "steps": steps,
                 }
-                
-                # Save to DB
-                # Note: We need a new synchronous session since we are in an async generator context and the outer session might be closed or concurrent
+                final_payload = {**item, "steps": steps}
+                yield (json.dumps(final_payload, ensure_ascii=False) + "\n").encode("utf-8")
+
                 from app.db.session import engine
                 with Session(engine) as db:
                     agent_msg = AgentMessage(
                         session_id=db_session.id,
                         role="AGENT",
-                        content=agent_content,
+                        content=item.get("content") or "",
                         metadata_json=json.dumps(structured_content, ensure_ascii=False)
                     )
                     db.add(agent_msg)
@@ -247,7 +378,8 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
                         sess.updated_at = datetime.now(timezone.utc)
                         db.add(sess)
                     db.commit()
-            
+                continue
+
             data = json.dumps(item, ensure_ascii=False) + "\n"
             yield data.encode("utf-8")
             if item.get("event") == "end":

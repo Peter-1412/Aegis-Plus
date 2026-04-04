@@ -27,7 +27,48 @@ class AgentState(TypedDict):
 
 from langchain_core.runnables.config import RunnableConfig
 
+DIAGNOSIS_KEYWORDS = [
+    "分析",
+    "排查",
+    "故障",
+    "异常",
+    "报错",
+    "为什么",
+    "哪里",
+    "看下",
+    "看看",
+    "根因",
+    "慢",
+    "502",
+    "503",
+    "超时",
+]
+
+
+def _get_stream_handler(config: RunnableConfig):
+    callbacks = config.get("callbacks") or []
+    for callback in callbacks:
+        if hasattr(callback, "emit_agent_thought"):
+            return callback
+    return None
+
+
+async def _emit_thought(config: RunnableConfig, thought: str):
+    handler = _get_stream_handler(config)
+    if handler:
+        await handler.emit_agent_thought(thought)
+
+
+def _looks_complex_request(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(keyword in lowered for keyword in DIAGNOSIS_KEYWORDS)
+
 async def classify_task(state: AgentState, config: RunnableConfig) -> dict:
+    current_input = state.get("input", "")
+    if _looks_complex_request(current_input):
+        await _emit_thought(config, "识别到故障排查类请求，进入多步诊断流程。")
+        return {"task_type": "complex"}
+
     llm = get_llm(state["model_name"])
     
     # 构建包含历史记录的 prompt
@@ -73,11 +114,22 @@ async def react_agent_node(state: AgentState, config: RunnableConfig) -> dict:
 
     executor = build_executor(llm, memory)
     
-    res = await executor.ainvoke({"input": state["input"]}, config=config)
+    await _emit_thought(config, "开始执行单轮查询，优先使用工具收集可验证证据。")
+    res = await executor.ainvoke(
+        {
+            "input": (
+                f"{state['input']}\n\n"
+                "要求：如果请求涉及系统状态、日志、指标、链路或故障原因，必须先调用至少一个工具，"
+                "不要直接凭经验作答。"
+            )
+        },
+        config=config,
+    )
     return {"response": res.get("output", "")}
 
 async def planner_node(state: AgentState, config: RunnableConfig) -> dict:
     llm = get_llm(state["model_name"])
+    await _emit_thought(config, "正在生成排查计划，随后会按步骤调用工具收集证据。")
     
     if state.get("past_steps"):
         context = "\n".join([f"步骤: {s}\n结果: {r}" for s, r in state["past_steps"]])
@@ -101,6 +153,8 @@ async def planner_node(state: AgentState, config: RunnableConfig) -> dict:
         
     res = await llm.ainvoke(prompt, config=config)
     plan = [line.strip().lstrip("0123456789.-* ") for line in res.content.split("\n") if line.strip()]
+    if plan:
+        await _emit_thought(config, f"已生成 {len(plan)} 个排查步骤，开始依次执行。")
     
     # 如果是飞书会话，主动发送一条消息告知计划，但不中断执行
     chat_id = state.get("session_id", "")
@@ -125,6 +179,7 @@ async def execute_step_node(state: AgentState, config: RunnableConfig) -> dict:
         return {"user_feedback": "", "pending_confirmation": ""}
 
     step = state["plan"][state["current_step_index"]]
+    await _emit_thought(config, f"开始执行步骤：{step}")
     
     # If user provided feedback
     if state.get("user_feedback"):
@@ -168,6 +223,10 @@ async def execute_step_node(state: AgentState, config: RunnableConfig) -> dict:
         f"初始请求: {state['input']}\n\n"
         f"之前执行的步骤和结果:\n{context}\n\n"
         f"当前需执行的步骤: {step}\n"
+        "要求：\n"
+        "1. 必须调用至少一个最相关的工具来收集证据，不允许直接凭空回答。\n"
+        "2. 若一个工具不够，请继续调用后再总结结果。\n"
+        "3. 返回内容应基于工具结果，简洁说明执行结果和证据。\n"
         "请执行该步骤，并返回执行结果。"
     )
     

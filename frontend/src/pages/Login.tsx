@@ -25,9 +25,13 @@ export default function LoginPage({ setUser }: LoginProps) {
         credentials: "include",
         body: JSON.stringify(values),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError(data.error || "登录失败");
+        if (res.status === 403) {
+          setError("账号未激活，请等待管理员审批");
+        } else {
+          setError(data.detail || data.message || data.error || "登录失败");
+        }
       } else {
         antMessage.success("登录成功");
         setUser(data.user);

@@ -53,28 +53,6 @@ class LoggingReActOutputParser(ReActSingleInputOutputParser):
             # Try to fix common JSON errors (e.g. double output) before giving up
             if "}{" in text:
                 text = text.split("}{")[0] + "}"
-            # If the model直接给出了 JSON（带或不带 ```json 包裹），将其视为最终答案
-            candidate = text.strip()
-            json_str: str | None = None
-            # 优先处理 ``` 包裹的情况
-            if candidate.startswith("```") and candidate.endswith("```"):
-                fenced = candidate.strip("`").strip()
-                if fenced.lower().startswith("json"):
-                    fenced = fenced[4:].strip()
-                try:
-                    obj = json.loads(fenced)
-                    json_str = json.dumps(obj, ensure_ascii=False)
-                except Exception:
-                    json_str = None
-            # 其次尝试直接解析为 JSON
-            if json_str is None:
-                try:
-                    obj = json.loads(candidate)
-                    json_str = json.dumps(obj, ensure_ascii=False)
-                except Exception:
-                    json_str = None
-            if json_str is not None:
-                return AgentFinish(return_values={"output": json_str}, log=text)
             try:
                 return super().parse(text)
             except Exception as e:

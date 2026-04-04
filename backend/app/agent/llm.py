@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Awaitable, Callable, List, Optional
 import logging
 import time
 import os
@@ -416,3 +416,69 @@ def get_llm(model_name: str | None = None, streaming: bool = False, allow_thinki
         streaming=streaming,
         disable_thinking=settings.ollama_disable_thinking and not allow_thinking,
     )
+
+
+async def stream_rendered_answer(
+    model_name: str | None,
+    prompt: str,
+    on_token: Callable[[str], Awaitable[None]],
+    allow_thinking: bool = False,
+) -> str:
+    selected = _normalize_model_name(model_name)
+    collected_parts: list[str] = []
+
+    async def emit_token(token: str):
+        if not token:
+            return
+        collected_parts.append(token)
+        await on_token(token)
+
+    if selected == "doubao":
+        api_key = settings.doubao_api_key or os.getenv("ARK_API_KEY")
+        if not api_key:
+            raise RuntimeError("doubao api_key 未配置")
+        client = AsyncOpenAI(base_url=settings.doubao_base_url, api_key=api_key)
+        extra_body = {"thinking": {"type": "enabled" if allow_thinking and settings.doubao_thinking_enabled else "disabled"}}
+        stream = await client.responses.create(
+            model=settings.doubao_model,
+            input=prompt,
+            temperature=settings.doubao_temperature,
+            max_output_tokens=settings.doubao_max_tokens,
+            extra_body=extra_body,
+            stream=True,
+        )
+        async with stream as events:
+            async for event in events:
+                if getattr(event, "type", "") == "response.output_text.delta":
+                    await emit_token(getattr(event, "delta", "") or "")
+        return "".join(collected_parts).strip()
+
+    if selected == "glm":
+        model = settings.ollama_glm_model
+    elif selected == "deepseek":
+        model = settings.ollama_deepseek_model
+    else:
+        model = settings.ollama_qwen_model
+
+    options: dict[str, Any] = {
+        "num_predict": settings.ollama_num_predict,
+        "temperature": settings.ollama_temperature,
+        "top_p": settings.ollama_top_p,
+    }
+    client = ollama.AsyncClient(host=settings.ollama_base_url)
+    stream = await client.chat(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+        think=False if settings.ollama_disable_thinking and not allow_thinking else None,
+        options=options,
+    )
+    async for chunk in stream:
+        message = getattr(chunk, "message", None) or {}
+        token = ""
+        if isinstance(message, dict):
+            token = str(message.get("content") or "")
+        else:
+            token = str(getattr(message, "content", "") or "")
+        await emit_token(token)
+    return "".join(collected_parts).strip()

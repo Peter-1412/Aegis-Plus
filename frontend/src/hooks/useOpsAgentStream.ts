@@ -1,55 +1,58 @@
-import { useState, useCallback } from 'react';
+import { useCallback, useState } from 'react';
+import type { AgentRootCause, AgentStep } from '../types';
 
-// 接口类型定义
-export interface OpsRootCause {
-  rank: number;
-  description: string;
-  probability?: number;
-  service?: string;
-  evidence_metrics?: string[];
-  evidence_logs?: string[];
-}
-
-export interface OpsFinalResult {
-  summary: string;
-  ranked_root_causes: OpsRootCause[];
-  next_actions: string[];
-}
-
-export interface ThinkStep {
+export interface StreamAgentMessage {
   id: string;
-  type: 'thought' | 'tool';
-  content: string; // 思考的内容 或 调用的工具名
-  toolInput?: string; // 工具的入参
-  toolOutput?: string; // 工具的返回结果
-  status: 'pending' | 'success' | 'error';
+  role: 'AGENT';
+  content: string;
+  createdAt: string;
+  summary?: string;
+  ranked_root_causes: AgentRootCause[];
+  next_actions: string[];
+  steps: AgentStep[];
+}
+
+function createDraftMessage(id: string): StreamAgentMessage {
+  return {
+    id,
+    role: 'AGENT',
+    content: '',
+    createdAt: new Date().toISOString(),
+    ranked_root_causes: [],
+    next_actions: [],
+    steps: [],
+  };
 }
 
 export function useOpsAgentStream() {
   const [isLoading, setIsLoading] = useState(false);
-  const [steps, setSteps] = useState<ThinkStep[]>([]);
-  const [finalResult, setFinalResult] = useState<OpsFinalResult | null>(null);
+  const [draftMessage, setDraftMessage] = useState<StreamAgentMessage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
 
   const analyze = useCallback(async (description: string, sessionId?: number) => {
+    const initialDraftId = `draft-${Date.now()}`;
     setIsLoading(true);
-    setSteps([]);
-    setFinalResult(null);
+    setDraftMessage(createDraftMessage(initialDraftId));
     setError(null);
     setCurrentSessionId(null);
 
     try {
-      const response = await fetch(`/api/agent/chat/stream`, {
+      const response = await fetch('/api/agent/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        credentials: "include",
-        body: JSON.stringify({ message: description, sessionId: sessionId }), 
+        credentials: 'include',
+        body: JSON.stringify({ message: description, sessionId }),
       });
 
-      if (!response.body) throw new Error('当前浏览器不支持 ReadableStream');
+      if (!response.ok) {
+        throw new Error(`请求失败: ${response.status}`);
+      }
+      if (!response.body) {
+        throw new Error('当前浏览器不支持 ReadableStream');
+      }
 
-      const returnedSessionId = response.headers.get("X-Session-ID");
+      const returnedSessionId = response.headers.get('X-Session-ID');
       let newSessionId = sessionId;
       if (returnedSessionId) {
         newSessionId = parseInt(returnedSessionId, 10);
@@ -60,84 +63,137 @@ export function useOpsAgentStream() {
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
 
+      const ensureDraft = (updater: (draft: StreamAgentMessage) => StreamAgentMessage) => {
+        setDraftMessage((prev) => updater(prev ?? createDraftMessage(initialDraftId)));
+      };
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        
-        // 将新读取的 chunk 拼接到 buffer 中
+
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
-        
-        // 最后一行可能是不完整的 JSON，保留在 buffer 中等待下一次拼接
-        buffer = lines.pop() || ''; 
+        buffer = lines.pop() || '';
 
         for (const line of lines) {
           if (!line.trim()) continue;
-          
+
           try {
             const data = JSON.parse(line);
-            
-            // 根据后端返回的 event 类型组装前台状态
+
             switch (data.event) {
               case 'agent_thought':
-                setSteps(prev => [...prev, {
-                  id: data.step_id || Math.random().toString(),
-                  type: 'thought',
-                  content: data.thought,
-                  status: 'success'
-                }]);
+                ensureDraft((draft) => ({
+                  ...draft,
+                  steps: [
+                    ...draft.steps,
+                    {
+                      id: data.step_id || crypto.randomUUID(),
+                      type: 'thought',
+                      content: data.thought || '',
+                      status: 'success',
+                    },
+                  ],
+                }));
                 break;
-                
-              case 'agent_action':
+
               case 'tool_start':
-                setSteps(prev => {
-                  // 避免重复添加同一个工具调用
-                  if (prev.find(s => s.id === data.step_id && s.type === 'tool')) return prev;
-                  return [...prev, {
-                    id: data.step_id || Math.random().toString(),
-                    type: 'tool',
-                    content: data.tool,
-                    toolInput: data.tool_input,
-                    status: 'pending'
-                  }];
+                ensureDraft((draft) => {
+                  const stepId = data.step_id || crypto.randomUUID();
+                  if (draft.steps.some((step) => step.id === stepId)) {
+                    return draft;
+                  }
+                  return {
+                    ...draft,
+                    steps: [
+                      ...draft.steps,
+                      {
+                        id: stepId,
+                        type: 'tool',
+                        content: data.tool || '',
+                        toolInput: data.tool_input || '',
+                        status: 'pending',
+                      },
+                    ],
+                  };
                 });
                 break;
-                
+
               case 'tool_end':
-              case 'agent_observation':
-                setSteps(prev => prev.map(step => 
-                  step.id === data.step_id 
-                    ? { ...step, toolOutput: data.observation, status: 'success' } 
-                    : step
-                ));
+                ensureDraft((draft) => ({
+                  ...draft,
+                  steps: draft.steps.map((step) =>
+                    step.id === data.step_id
+                      ? { ...step, toolOutput: data.observation || '', status: 'success' }
+                      : step,
+                  ),
+                }));
                 break;
-                
+
+              case 'assistant_message_start':
+                ensureDraft((draft) => ({
+                  ...draft,
+                  id: data.message_id || draft.id,
+                }));
+                break;
+
+              case 'assistant_message_delta':
+                ensureDraft((draft) => ({
+                  ...draft,
+                  id: data.message_id || draft.id,
+                  content: `${draft.content}${data.delta || ''}`,
+                }));
+                break;
+
+              case 'assistant_message_end':
+                ensureDraft((draft) => ({
+                  ...draft,
+                  id: data.message_id || draft.id,
+                  content: data.content || draft.content,
+                }));
+                break;
+
+              case 'final':
+                ensureDraft((draft) => ({
+                  ...draft,
+                  id: data.message_id || draft.id,
+                  content: data.content || draft.content,
+                  summary: data.summary || '',
+                  ranked_root_causes: data.ranked_root_causes || [],
+                  next_actions: data.next_actions || [],
+                  steps: Array.isArray(data.steps) ? data.steps : draft.steps,
+                }));
+                break;
+
               case 'error':
                 if (data.step_id) {
-                  setSteps(prev => prev.map(step => 
-                    step.id === data.step_id ? { ...step, status: 'error', toolOutput: data.error_message } : step
-                  ));
+                  ensureDraft((draft) => ({
+                    ...draft,
+                    steps: draft.steps.map((step) =>
+                      step.id === data.step_id
+                        ? {
+                            ...step,
+                            status: 'error',
+                            toolOutput: data.error_message || data.message || '执行失败',
+                          }
+                        : step,
+                    ),
+                  }));
                 } else {
-                  setError(data.message || data.error_message);
+                  setError(data.message || data.error_message || '分析失败');
                 }
                 break;
-                
-              case 'final':
-                setFinalResult({
-                  summary: data.summary,
-                  ranked_root_causes: data.ranked_root_causes,
-                  next_actions: data.next_actions
-                });
-                break;
             }
-          } catch (e) {
-            console.error('解析 NDJSON 失败:', line, e);
+          } catch (parseError) {
+            console.error('解析 NDJSON 失败:', line, parseError);
           }
         }
       }
+
       return newSessionId;
-    } catch (err: any) {
-      setError(err.message || '网络请求异常');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '网络请求异常';
+      setError(message);
       return sessionId;
     } finally {
       setIsLoading(false);
@@ -145,10 +201,9 @@ export function useOpsAgentStream() {
   }, []);
 
   const clear = useCallback(() => {
-    setSteps([]);
-    setFinalResult(null);
+    setDraftMessage(null);
     setError(null);
   }, []);
 
-  return { analyze, isLoading, steps, finalResult, error, currentSessionId, clear };
+  return { analyze, isLoading, draftMessage, error, currentSessionId, clear };
 }
