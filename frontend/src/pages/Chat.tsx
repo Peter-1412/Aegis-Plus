@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AgentArtifact,
   AgentLinkMeta,
   AgentMessage,
   AgentRootCause,
@@ -41,6 +42,12 @@ import {
 } from "../hooks/useOpsAgentStream";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  copyArtifactText,
+  openArtifactCommand,
+  openArtifactFile,
+  openArtifactUrl,
+} from "../hostActions";
 
 const { Text } = Typography;
 
@@ -54,18 +61,173 @@ type AgentRenderContent = {
   timeline: AgentTimelineItem[];
 };
 
+function formatFileLabel(path: string, lineStart?: number, lineEnd?: number) {
+  const suffix =
+    typeof lineStart === "number"
+      ? `:${lineStart}${typeof lineEnd === "number" ? `-${lineEnd}` : ""}`
+      : "";
+  return `${path}${suffix}`;
+}
+
+const primaryArtifactButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  padding: "2px 8px",
+  borderRadius: 999,
+  backgroundColor: "#e6f4ff",
+  color: "#1677ff",
+  fontSize: 12,
+  border: "1px solid #91caff",
+  cursor: "pointer",
+};
+
+const secondaryArtifactButtonStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  padding: "2px 8px",
+  borderRadius: 999,
+  backgroundColor: "#f5f5f5",
+  color: "#595959",
+  fontSize: 12,
+  border: "1px solid #d9d9d9",
+  cursor: "pointer",
+};
+
+const ArtifactLink: React.FC<{ artifact: AgentArtifact }> = ({ artifact }) => {
+  if (artifact.type === "command_ref") {
+    return (
+      <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <button
+          type="button"
+          onClick={async () => {
+            const handled = await openArtifactCommand(artifact.commandId, artifact.terminalId);
+            const payload = artifact.terminalId
+              ? `terminalId=${artifact.terminalId}\ncommandId=${artifact.commandId}`
+              : artifact.commandId;
+            if (handled) {
+              void antMessage.success(`已打开命令记录: ${artifact.commandId}`);
+              return;
+            }
+            await copyArtifactText(payload).catch(() => undefined);
+            void antMessage.success(`已复制命令信息: ${artifact.commandId}`);
+          }}
+          style={secondaryArtifactButtonStyle}
+          title={artifact.terminalId ? `terminal ${artifact.terminalId}` : artifact.commandId}
+        >
+          {artifact.label}
+        </button>
+        <span style={{ fontSize: 12, color: "#8c8c8c" }}>
+          {artifact.terminalId ? `terminal ${artifact.terminalId}` : "无 terminalId"} | {artifact.commandId}
+        </span>
+      </div>
+    );
+  }
+
+  if (artifact.type === "file_ref") {
+    const label = formatFileLabel(artifact.path, artifact.lineStart, artifact.lineEnd);
+    return (
+      <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <button
+          type="button"
+          onClick={() => {
+            void openArtifactFile(artifact.path, artifact.lineStart, artifact.lineEnd);
+          }}
+          style={primaryArtifactButtonStyle}
+          title={label}
+        >
+          {artifact.label}
+        </button>
+        <button
+          type="button"
+          onClick={async () => {
+            await copyArtifactText(label).catch(() => undefined);
+            void antMessage.success(`已复制文件定位: ${label}`);
+          }}
+          style={secondaryArtifactButtonStyle}
+        >
+          复制路径
+        </button>
+        <span style={{ fontSize: 12, color: "#8c8c8c" }} title={label}>
+          {label}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: "inline-flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+      <button
+        type="button"
+        onClick={() => {
+          void openArtifactUrl(artifact.url, artifact.type);
+        }}
+        style={primaryArtifactButtonStyle}
+        title={artifact.url}
+      >
+        {artifact.label}
+      </button>
+      <button
+        type="button"
+        onClick={async () => {
+          await copyArtifactText(artifact.url).catch(() => undefined);
+          void antMessage.success("已复制链接");
+        }}
+        style={secondaryArtifactButtonStyle}
+      >
+        复制链接
+      </button>
+    </div>
+  );
+};
+
 const MetaLinks: React.FC<{ meta?: AgentLinkMeta }> = ({ meta }) => {
   if (!meta) return null;
-  const chips: string[] = [];
+  const artifacts: AgentArtifact[] = [...(meta.artifacts || [])];
   if (meta.path) {
-    chips.push(meta.lineStart ? `${meta.path}:${meta.lineStart}${meta.lineEnd ? `-${meta.lineEnd}` : ""}` : meta.path);
+    artifacts.push({
+      type: "file_ref",
+      label: "打开文件",
+      path: meta.path,
+      lineStart: meta.lineStart,
+      lineEnd: meta.lineEnd,
+    });
   }
-  if (meta.terminalId) chips.push(`terminal ${meta.terminalId}`);
-  if (meta.commandId) chips.push(`command ${meta.commandId}`);
-  if (meta.previewUrl) chips.push(meta.previewUrl);
-  if (meta.url) chips.push(meta.url);
-  if (!chips.length) return null;
-  return <div style={{ fontSize: "12px", color: "#8c8c8c", marginTop: 8 }}>{chips.join(" | ")}</div>;
+  if (meta.previewUrl) {
+    artifacts.push({ type: "preview", label: "打开预览", url: meta.previewUrl });
+  }
+  if (meta.url) {
+    artifacts.push({ type: "url", label: "打开链接", url: meta.url });
+  }
+  if (meta.commandId) {
+    artifacts.push({
+      type: "command_ref",
+      label: "命令记录",
+      commandId: meta.commandId,
+      terminalId: meta.terminalId,
+    });
+  }
+
+  if (!artifacts.length) return null;
+  const dedupedArtifacts = artifacts.filter((artifact, index) => {
+    const key = JSON.stringify(artifact);
+    return artifacts.findIndex((candidate) => JSON.stringify(candidate) === key) === index;
+  });
+  return (
+    <div
+      style={{
+        fontSize: "12px",
+        color: "#8c8c8c",
+        marginTop: 8,
+        display: "flex",
+        gap: 8,
+        flexWrap: "wrap",
+      }}
+    >
+      {dedupedArtifacts.map((artifact, index) => (
+        <ArtifactLink key={`${artifact.type}-${index}`} artifact={artifact} />
+      ))}
+    </div>
+  );
 };
 
 const TimelineBlock: React.FC<{ item: AgentTimelineItem }> = ({ item }) => {

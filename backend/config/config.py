@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     service_name: str = "ops-service"
 
     loki_base_url: str = "http://loki.monitoring.svc.cluster.local:3100"
+    grafana_base_url: str | None = None
     loki_tenant_id: str | None = None
     loki_service_label_key: str = "app"
     loki_selector_template: str = '{{{label_key}="{service}"}}'

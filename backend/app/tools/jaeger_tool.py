@@ -139,6 +139,7 @@ async def jaeger_query_traces(
         "start": start.isoformat(),
         "end": end.isoformat(),
         "limit": limit_valid,
+        "search_url": f"{base_url}/search?service={service_name}" if base_url else None,
         "trace_summaries": traces_summary,
     }
     dt = time.monotonic() - t0

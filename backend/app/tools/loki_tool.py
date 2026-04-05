@@ -352,10 +352,25 @@ def make_loki_collect_evidence(loki: LokiClient):
                 break
         if not evidence_lines:
             evidence_lines = ["在该时间范围内未检索到明显的错误或相关日志（基于通用error正则与关键词搜索）。"]
+        query_examples = []
+        for service in services[:3]:
+            selector = settings.loki_selector_template.format(
+                label_key=settings.loki_service_label_key,
+                service=service,
+            )
+            query_examples.append(
+                {
+                    "service": service,
+                    "query": f'{selector} |~ "{error_regex}"',
+                }
+            )
         result = {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
             "services": services,
             "evidence_lines": evidence_lines[:max_total_lines_valid],
             "loki_api": {"path": "/loki/api/v1/query_range"},
+            "query_examples": query_examples,
         }
         dt = time.monotonic() - t0
         logging.info(

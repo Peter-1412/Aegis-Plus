@@ -4,6 +4,7 @@ import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import AsyncIterator, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -17,6 +18,7 @@ from app.agent.ops_agent import ensure_cst
 from app.agent.llm import stream_rendered_answer
 from app.models import OpsRequest, TimeRange
 from app.agent.shared import ops_agent, OpsStreamHandler, _request_id_var
+from config.config import settings
 
 router = APIRouter()
 
@@ -73,6 +75,183 @@ def build_render_prompt(summary: str, ranked_root_causes: list[dict], next_actio
     )
 
 
+def _try_parse_json(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _extract_tool_payload(item: dict) -> dict:
+    observation = _try_parse_json(item.get("observation"))
+    tool_input = _try_parse_json(item.get("tool_input"))
+    payload: dict = {}
+    if isinstance(tool_input, dict):
+        payload.update(tool_input)
+    if isinstance(observation, dict):
+        payload.update(observation)
+    return payload
+
+
+def _build_tool_meta(item: dict) -> dict:
+    tool_name = str(item.get("tool") or "")
+    payload = _extract_tool_payload(item)
+    meta = dict(item.get("meta") or {})
+    artifacts = list(meta.get("artifacts") or [])
+
+    if tool_name == "prometheus_query_range":
+        query = str(payload.get("promql") or payload.get("query") or "").strip()
+        start = str(payload.get("start") or "").strip()
+        end = str(payload.get("end") or "").strip()
+        step = str(payload.get("step") or "").strip()
+        base = settings.prometheus_base_url.rstrip("/")
+        if query:
+            artifacts.append(
+                {
+                    "type": "url",
+                    "label": "Prometheus Graph",
+                    "url": f"{base}/graph?g0.expr={quote(query)}",
+                }
+            )
+            if start and end:
+                api_url = f"{base}/api/v1/query_range?query={quote(query)}&start={quote(start)}&end={quote(end)}"
+                if step:
+                    api_url += f"&step={quote(step)}"
+                artifacts.append(
+                    {
+                        "type": "url",
+                        "label": "Prometheus API",
+                        "url": api_url,
+                    }
+                )
+
+    elif tool_name == "jaeger_query_traces":
+        service = str(payload.get("service") or "").strip()
+        base = (settings.jaeger_base_url or "").rstrip("/")
+        api_url = str(payload.get("url") or "").strip()
+        search_url = str(payload.get("search_url") or "").strip()
+        if base and service:
+            artifacts.append(
+                {
+                    "type": "url",
+                    "label": "Jaeger Search",
+                    "url": f"{base}/search?service={quote(service)}",
+                }
+            )
+        elif search_url:
+            artifacts.append(
+                {
+                    "type": "url",
+                    "label": "Jaeger Search",
+                    "url": search_url,
+                }
+            )
+        if api_url:
+            artifacts.append(
+                {
+                    "type": "url",
+                    "label": "Jaeger API",
+                    "url": api_url,
+                }
+            )
+        for trace in (payload.get("trace_summaries") or [])[:3]:
+            trace_id = str(trace.get("trace_id") or "").strip()
+            if base and trace_id:
+                artifacts.append(
+                    {
+                        "type": "url",
+                        "label": f"Trace {trace_id[:8]}",
+                        "url": f"{base}/trace/{quote(trace_id)}",
+                    }
+                )
+
+    elif tool_name == "loki_collect_evidence":
+        base = settings.loki_base_url.rstrip("/")
+        api_path = ""
+        if isinstance(payload.get("loki_api"), dict):
+            api_path = str(payload.get("loki_api", {}).get("path") or "").strip()
+        if api_path:
+            artifacts.append(
+                {
+                    "type": "url",
+                    "label": "Loki API",
+                    "url": f"{base}{api_path}",
+                }
+            )
+        grafana_base = (settings.grafana_base_url or "").rstrip("/")
+        start = str(payload.get("start") or "").strip()
+        end = str(payload.get("end") or "").strip()
+        for query_item in (payload.get("query_examples") or [])[:3]:
+            query = str(query_item.get("query") or "").strip()
+            service = str(query_item.get("service") or "").strip()
+            if grafana_base and query:
+                left_payload = {
+                    "datasource": "Loki",
+                    "queries": [{"expr": query, "refId": "A"}],
+                    "range": {"from": start, "to": end},
+                }
+                artifacts.append(
+                    {
+                        "type": "url",
+                        "label": f"Grafana Explore{f' ({service})' if service else ''}",
+                        "url": f"{grafana_base}/explore?left={quote(json.dumps(left_payload, ensure_ascii=False))}",
+                    }
+                )
+
+    if meta.get("path"):
+        artifacts.append(
+            {
+                "type": "file_ref",
+                "label": "打开文件",
+                "path": meta["path"],
+                "lineStart": meta.get("lineStart"),
+                "lineEnd": meta.get("lineEnd"),
+            }
+        )
+    if meta.get("previewUrl"):
+        artifacts.append(
+            {
+                "type": "preview",
+                "label": "打开预览",
+                "url": meta["previewUrl"],
+            }
+        )
+    if meta.get("url"):
+        artifacts.append(
+            {
+                "type": "url",
+                "label": "打开链接",
+                "url": meta["url"],
+            }
+        )
+    if meta.get("commandId"):
+        artifacts.append(
+            {
+                "type": "command_ref",
+                "label": "命令记录",
+                "commandId": meta["commandId"],
+                "terminalId": meta.get("terminalId"),
+            }
+        )
+
+    if artifacts:
+        deduped = []
+        seen = set()
+        for artifact in artifacts:
+            key = json.dumps(artifact, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(artifact)
+        meta["artifacts"] = deduped
+    return meta
+
+
 def build_timeline_payload(item: dict) -> dict | None:
     event_type = item.get("event")
     step_id = item.get("step_id")
@@ -99,7 +278,7 @@ def build_timeline_payload(item: dict) -> dict | None:
             "outputText": "",
             "resultState": item.get("result_state"),
             "resultSummary": item.get("result_summary"),
-            "meta": item.get("meta") or {},
+            "meta": _build_tool_meta(item),
         }
 
     if event_type == "tool_call_running":
@@ -111,7 +290,7 @@ def build_timeline_payload(item: dict) -> dict | None:
             "inputText": item.get("tool_input") or "",
             "resultState": item.get("result_state"),
             "resultSummary": item.get("result_summary"),
-            "meta": item.get("meta") or {},
+            "meta": _build_tool_meta(item),
         }
 
     if event_type == "tool_call_completed":
@@ -123,6 +302,7 @@ def build_timeline_payload(item: dict) -> dict | None:
             "outputText": item.get("observation") or "",
             "resultState": item.get("result_state") or "ok",
             "resultSummary": item.get("result_summary"),
+            "meta": _build_tool_meta(item),
         }
 
     if event_type in {"tool_call_failed"}:
@@ -134,6 +314,7 @@ def build_timeline_payload(item: dict) -> dict | None:
             "outputText": item.get("error_message") or item.get("message") or "",
             "resultState": item.get("result_state") or "runtime_error",
             "resultSummary": item.get("result_summary"),
+            "meta": _build_tool_meta(item),
         }
 
     if event_type == "node_failure":

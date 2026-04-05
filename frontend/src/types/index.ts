@@ -49,6 +49,7 @@ export type AgentMessage = {
 };
 
 export type AgentLinkMeta = {
+  artifacts?: AgentArtifact[];
   path?: string;
   lineStart?: number;
   lineEnd?: number;
@@ -57,6 +58,26 @@ export type AgentLinkMeta = {
   previewUrl?: string;
   url?: string;
 };
+
+export type AgentArtifact =
+  | {
+      type: "url" | "preview";
+      label: string;
+      url: string;
+    }
+  | {
+      type: "file_ref";
+      label: string;
+      path: string;
+      lineStart?: number;
+      lineEnd?: number;
+    }
+  | {
+      type: "command_ref";
+      label: string;
+      commandId: string;
+      terminalId?: string;
+    };
 
 export type AgentTimelineItem =
   | {
