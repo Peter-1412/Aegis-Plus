@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AgentRootCause, AgentTimelineItem } from '../types';
 
 export interface StreamAgentMessage {
@@ -10,6 +10,8 @@ export interface StreamAgentMessage {
   ranked_root_causes: AgentRootCause[];
   next_actions: string[];
   timeline: AgentTimelineItem[];
+  statusText?: string;
+  isTyping?: boolean;
 }
 
 function createDraftMessage(id: string): StreamAgentMessage {
@@ -21,7 +23,26 @@ function createDraftMessage(id: string): StreamAgentMessage {
     ranked_root_causes: [],
     next_actions: [],
     timeline: [],
+    statusText: '正在准备分析...',
+    isTyping: false,
   };
+}
+
+function takePlaybackChunk(buffer: string) {
+  if (!buffer) return '';
+  const sentenceLikeChunk = buffer.match(/^[^\n。！？；，,]{1,3}[。！？；，,\n]?/);
+  if (sentenceLikeChunk) return sentenceLikeChunk[0];
+  return buffer.slice(0, 2);
+}
+
+function appendPreviewStatus(existing: string | undefined, incoming: string) {
+  const next = incoming.trim();
+  if (!next) return (existing || '').trim();
+  const current = (existing || '').trim();
+  if (!current || current === '正在生成回答...') return next;
+  const lines = current.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines[lines.length - 1] === next) return current;
+  return `${current}\n${next}`;
 }
 
 export function useOpsAgentStream() {
@@ -29,9 +50,82 @@ export function useOpsAgentStream() {
   const [draftMessage, setDraftMessage] = useState<StreamAgentMessage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<number | null>(null);
+  const pendingContentRef = useRef('');
+  const playbackTimerRef = useRef<number | null>(null);
+  const streamEndedRef = useRef(false);
+  const finalContentRef = useRef('');
+  const activeDraftIdRef = useRef('');
+  const hasAssistantStreamRef = useRef(false);
+  const playbackSettledResolverRef = useRef<(() => void) | null>(null);
+
+  const resolvePlaybackSettled = useCallback(() => {
+    if (playbackSettledResolverRef.current) {
+      playbackSettledResolverRef.current();
+      playbackSettledResolverRef.current = null;
+    }
+  }, []);
+
+  const stopPlayback = useCallback(() => {
+    if (playbackTimerRef.current !== null) {
+      window.clearTimeout(playbackTimerRef.current);
+      playbackTimerRef.current = null;
+    }
+  }, []);
+
+  const drainPlayback = useCallback(() => {
+    if (playbackTimerRef.current !== null) return;
+
+    const step = () => {
+      const chunk = takePlaybackChunk(pendingContentRef.current);
+      if (!chunk) {
+        playbackTimerRef.current = null;
+        if (streamEndedRef.current) {
+          setDraftMessage((prev) =>
+            prev && prev.id === activeDraftIdRef.current
+              ? {
+                  ...prev,
+                  content: finalContentRef.current || prev.content,
+                  statusText: '',
+                  isTyping: false,
+                }
+              : prev,
+          );
+          resolvePlaybackSettled();
+        }
+        return;
+      }
+
+      pendingContentRef.current = pendingContentRef.current.slice(chunk.length);
+      setDraftMessage((prev) =>
+        prev && prev.id === activeDraftIdRef.current
+          ? {
+              ...prev,
+              content: `${prev.content}${chunk}`,
+              isTyping: true,
+            }
+          : prev,
+      );
+
+      playbackTimerRef.current = window.setTimeout(step, chunk.length <= 1 ? 22 : 30);
+    };
+
+    playbackTimerRef.current = window.setTimeout(step, 16);
+  }, [resolvePlaybackSettled]);
+
+  useEffect(() => {
+    return () => {
+      stopPlayback();
+    };
+  }, [stopPlayback]);
 
   const analyze = useCallback(async (description: string, sessionId?: number) => {
     const initialDraftId = `draft-${Date.now()}`;
+    activeDraftIdRef.current = initialDraftId;
+    pendingContentRef.current = '';
+    streamEndedRef.current = false;
+    finalContentRef.current = '';
+    hasAssistantStreamRef.current = false;
+    stopPlayback();
     setIsLoading(true);
     setDraftMessage(createDraftMessage(initialDraftId));
     setError(null);
@@ -62,6 +156,9 @@ export function useOpsAgentStream() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let buffer = '';
+      const playbackSettledPromise = new Promise<void>((resolve) => {
+        playbackSettledResolverRef.current = resolve;
+      });
 
       const ensureDraft = (updater: (draft: StreamAgentMessage) => StreamAgentMessage) => {
         setDraftMessage((prev) => updater(prev ?? createDraftMessage(initialDraftId)));
@@ -105,14 +202,14 @@ export function useOpsAgentStream() {
                     phase: data.workflow_stage || 'planning',
                     status: 'completed',
                   }),
+                  statusText: draft.content ? draft.statusText : data.thought || draft.statusText,
                 }));
                 break;
 
               case 'tool_call_started':
-                ensureDraft((draft) => {
-                  const stepId = data.step_id || crypto.randomUUID();
-                  return upsertTimeline(draft, {
-                    id: stepId,
+                ensureDraft((draft) => ({
+                  ...upsertTimeline(draft, {
+                    id: data.step_id || crypto.randomUUID(),
                     kind: 'tool_call',
                     toolName: data.tool || '',
                     inputText: data.tool_input || '',
@@ -121,15 +218,15 @@ export function useOpsAgentStream() {
                     resultState: data.result_state,
                     resultSummary: data.result_summary,
                     status: data.status || 'started',
-                  });
-                });
+                  }),
+                  statusText: draft.content ? draft.statusText : (data.tool ? `正在准备调用工具：${data.tool}` : draft.statusText),
+                }));
                 break;
 
               case 'tool_call_running':
-                ensureDraft((draft) => {
-                  const stepId = data.step_id || crypto.randomUUID();
-                  return upsertTimeline(draft, {
-                    id: stepId,
+                ensureDraft((draft) => ({
+                  ...upsertTimeline(draft, {
+                    id: data.step_id || crypto.randomUUID(),
                     kind: 'tool_call',
                     toolName: data.tool || '',
                     inputText: data.tool_input || '',
@@ -137,8 +234,9 @@ export function useOpsAgentStream() {
                     resultState: data.result_state,
                     resultSummary: data.result_summary,
                     status: 'running',
-                  });
-                });
+                  }),
+                  statusText: draft.content ? draft.statusText : (data.tool ? `正在调用工具：${data.tool}` : draft.statusText),
+                }));
                 break;
 
               case 'tool_call_completed':
@@ -152,6 +250,7 @@ export function useOpsAgentStream() {
                     resultSummary: data.result_summary,
                     status: 'completed',
                   }),
+                  statusText: draft.content ? draft.statusText : (data.tool ? `已完成工具调用：${data.tool}` : draft.statusText),
                 }));
                 break;
 
@@ -166,6 +265,7 @@ export function useOpsAgentStream() {
                     resultSummary: data.result_summary,
                     status: 'failed',
                   }),
+                  statusText: data.tool ? `工具调用失败：${data.tool}` : '工具调用失败',
                 }));
                 break;
 
@@ -179,37 +279,77 @@ export function useOpsAgentStream() {
                     detail: data.detail || '',
                     status: 'failed',
                   }),
+                  statusText: data.message || '当前节点已停止。',
+                  isTyping: false,
                 }));
                 break;
 
               case 'assistant_message_start':
+                hasAssistantStreamRef.current = true;
+                pendingContentRef.current = '';
+                streamEndedRef.current = false;
+                finalContentRef.current = '';
                 ensureDraft((draft) => ({
                   ...draft,
                   id: data.message_id || draft.id,
+                  content: draft.content,
+                  statusText: draft.statusText || '正在生成回答...',
+                  isTyping: true,
                 }));
                 break;
 
+              case 'assistant_message_preview':
+                ensureDraft((draft) => {
+                  const previewDelta = String(data.delta || '').trim();
+                  if (!previewDelta || draft.content) {
+                    return {
+                      ...draft,
+                      id: data.message_id || draft.id,
+                      isTyping: true,
+                    };
+                  }
+                  return {
+                    ...draft,
+                    id: data.message_id || draft.id,
+                    statusText: appendPreviewStatus(draft.statusText, previewDelta),
+                    isTyping: true,
+                  };
+                });
+                break;
+
               case 'assistant_message_delta':
+                pendingContentRef.current += data.delta || '';
+                drainPlayback();
                 ensureDraft((draft) => ({
                   ...draft,
                   id: data.message_id || draft.id,
-                  content: `${draft.content}${data.delta || ''}`,
+                  statusText: '',
+                  isTyping: true,
                 }));
                 break;
 
               case 'assistant_message_end':
-                ensureDraft((draft) => ({
-                  ...draft,
-                  id: data.message_id || draft.id,
-                  content: data.content || draft.content,
-                }));
+                streamEndedRef.current = true;
+                finalContentRef.current = data.content || '';
+                if (!pendingContentRef.current) {
+                  ensureDraft((draft) => ({
+                    ...draft,
+                    id: data.message_id || draft.id,
+                    content: data.content || draft.content,
+                    statusText: '',
+                    isTyping: false,
+                  }));
+                  resolvePlaybackSettled();
+                } else {
+                  drainPlayback();
+                }
                 break;
 
               case 'final':
                 ensureDraft((draft) => ({
                   ...draft,
                   id: data.message_id || draft.id,
-                  content: data.content || draft.content,
+                  content: draft.content,
                   summary: data.summary || '',
                   ranked_root_causes: data.ranked_root_causes || [],
                   next_actions: data.next_actions || [],
@@ -227,7 +367,14 @@ export function useOpsAgentStream() {
                     detail: data.error_message || data.message || '',
                     status: 'failed',
                   }),
+                  statusText: data.message || data.error_message || '分析失败',
+                  isTyping: false,
                 }));
+                pendingContentRef.current = '';
+                streamEndedRef.current = true;
+                finalContentRef.current = '';
+                stopPlayback();
+                resolvePlaybackSettled();
                 setError(data.message || data.error_message || '分析失败');
                 break;
             }
@@ -237,20 +384,33 @@ export function useOpsAgentStream() {
         }
       }
 
+      if (hasAssistantStreamRef.current) {
+        await playbackSettledPromise;
+      } else {
+        resolvePlaybackSettled();
+      }
+
       return newSessionId;
     } catch (err) {
+      resolvePlaybackSettled();
       const message = err instanceof Error ? err.message : '网络请求异常';
       setError(message);
       return sessionId;
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [drainPlayback, stopPlayback]);
 
   const clear = useCallback(() => {
+    stopPlayback();
+    pendingContentRef.current = '';
+    streamEndedRef.current = false;
+    finalContentRef.current = '';
+    hasAssistantStreamRef.current = false;
+    resolvePlaybackSettled();
     setDraftMessage(null);
     setError(null);
-  }, []);
+  }, [resolvePlaybackSettled, stopPlayback]);
 
   return { analyze, isLoading, draftMessage, error, currentSessionId, clear };
 }

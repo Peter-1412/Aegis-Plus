@@ -48,8 +48,9 @@ def _classify_tool_result(text: str, *, failed: bool = False) -> tuple[str, str]
     return "ok", "工具返回有效结果"
 
 class OpsStreamHandler(AsyncCallbackHandler):
-    def __init__(self, queue: asyncio.Queue):
+    def __init__(self, queue: asyncio.Queue, assistant_message_id: str | None = None):
         self.queue = queue
+        self.assistant_message_id = assistant_message_id
         self.session_id = str(uuid.uuid4())
         self.step_counter = 0
         self.current_workflow_stage = "thinking"
@@ -57,6 +58,7 @@ class OpsStreamHandler(AsyncCallbackHandler):
         self.pending_tool_step_id: str | None = None
         self.pending_tool_name: str | None = None
         self.pending_tool_input: str | None = None
+        self.last_assistant_preview: str = ""
 
     def _next_step_id(self) -> str:
         self.step_counter += 1
@@ -73,6 +75,24 @@ class OpsStreamHandler(AsyncCallbackHandler):
         payload.update(data)
         await self.queue.put(payload)
 
+    async def _emit_assistant_preview(self, text: str):
+        preview = (text or "").strip()
+        if not preview or not self.assistant_message_id:
+            return
+        preview = preview.splitlines()[0].strip()
+        if preview.lower().startswith("thought:"):
+            preview = preview[8:].strip()
+        if preview == self.last_assistant_preview:
+            return
+        self.last_assistant_preview = preview
+        await self._send_event(
+            "assistant_message_preview",
+            {
+                "message_id": self.assistant_message_id,
+                "delta": preview,
+            },
+        )
+
     async def emit_agent_thought(self, thought: str):
         self.current_workflow_stage = "planning"
         thought_step_id = self._next_step_id()
@@ -84,6 +104,7 @@ class OpsStreamHandler(AsyncCallbackHandler):
                 "title": "思路摘要",
             },
         )
+        await self._emit_assistant_preview(thought)
 
     async def on_agent_action(self, action, **kwargs):
         tool = getattr(action, "tool", "") or ""
@@ -106,6 +127,7 @@ class OpsStreamHandler(AsyncCallbackHandler):
                 "status": "started",
             },
         )
+        await self._emit_assistant_preview(f"正在准备调用工具：{self.pending_tool_name}")
 
     async def on_tool_start(self, serialized, input_str, **kwargs):
         name = None
@@ -126,6 +148,7 @@ class OpsStreamHandler(AsyncCallbackHandler):
                 "status": "running",
             },
         )
+        await self._emit_assistant_preview(f"正在调用工具：{self.pending_tool_name or name}")
 
     async def on_tool_end(self, output, **kwargs):
         self.current_workflow_stage = "observing"
@@ -143,6 +166,7 @@ class OpsStreamHandler(AsyncCallbackHandler):
                 "result_summary": result_summary,
             },
         )
+        await self._emit_assistant_preview(f"已完成工具调用：{self.pending_tool_name or ''}。{result_summary}")
         self.pending_tool_step_id = None
         self.pending_tool_name = None
         self.pending_tool_input = None
@@ -162,4 +186,6 @@ class OpsStreamHandler(AsyncCallbackHandler):
                 "result_summary": result_summary,
             },
         )
+        if self.pending_tool_name:
+            await self._emit_assistant_preview(f"工具调用失败：{self.pending_tool_name}。{result_summary}")
 

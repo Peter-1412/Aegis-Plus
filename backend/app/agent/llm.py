@@ -427,11 +427,35 @@ async def stream_rendered_answer(
     selected = _normalize_model_name(model_name)
     collected_parts: list[str] = []
 
+    def iter_stream_chunks(text: str):
+        remaining = text or ""
+        while remaining:
+            if remaining[0] in "\r\n":
+                yield remaining[0]
+                remaining = remaining[1:]
+                continue
+            if len(remaining) <= 3:
+                yield remaining
+                break
+            chunk = remaining[:3]
+            punctuation_index = -1
+            for idx, ch in enumerate(chunk):
+                if ch in "，。！？；：,.!?;:":
+                    punctuation_index = idx + 1
+                    break
+            if punctuation_index > 0:
+                yield remaining[:punctuation_index]
+                remaining = remaining[punctuation_index:]
+            else:
+                yield chunk
+                remaining = remaining[3:]
+
     async def emit_token(token: str):
         if not token:
             return
         collected_parts.append(token)
-        await on_token(token)
+        for chunk in iter_stream_chunks(token):
+            await on_token(chunk)
 
     if selected == "doubao":
         api_key = settings.doubao_api_key or os.getenv("ARK_API_KEY")

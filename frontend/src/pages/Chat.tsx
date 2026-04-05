@@ -389,7 +389,40 @@ const TimelineBlock: React.FC<{ item: AgentTimelineItem }> = ({ item }) => {
   );
 };
 
-const MarkdownMessage: React.FC<{ content: string }> = ({ content }) => (
+const StreamingCursor: React.FC = () => (
+  <span
+    style={{
+      display: "inline-block",
+      width: 8,
+      marginLeft: 2,
+      color: "#1677ff",
+      animation: "aegis-cursor-blink 1s step-end infinite",
+    }}
+  >
+    |
+  </span>
+);
+
+const PlainStreamingMessage: React.FC<{ content: string; trailingCursor?: boolean }> = ({
+  content,
+  trailingCursor = false,
+}) => (
+  <div
+    style={{
+      whiteSpace: "pre-wrap",
+      lineHeight: 1.7,
+      color: "#262626",
+    }}
+  >
+    {content}
+    {trailingCursor ? <StreamingCursor /> : null}
+  </div>
+);
+
+const MarkdownMessage: React.FC<{ content: string; trailingCursor?: boolean }> = ({
+  content,
+  trailingCursor = false,
+}) => (
   <div className="agent-markdown">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
@@ -422,6 +455,7 @@ const MarkdownMessage: React.FC<{ content: string }> = ({ content }) => (
     >
       {content}
     </ReactMarkdown>
+    {trailingCursor ? <StreamingCursor /> : null}
   </div>
 );
 
@@ -834,6 +868,10 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
           />
           <style>
             {`
+              @keyframes aegis-cursor-blink {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0; }
+              }
               .session-list-item:hover .session-actions {
                  visibility: visible !important;
               }
@@ -963,7 +1001,24 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
                     border: "1px solid #d9d9d9",
                   }}
                 >
-                  <MarkdownMessage content={renderedDraft?.content || "正在分析，请稍候..."} />
+                  {draftMessage.isTyping ? (
+                    <PlainStreamingMessage
+                      content={
+                        renderedDraft?.content ||
+                        draftMessage.statusText ||
+                        "正在分析，请稍候..."
+                      }
+                      trailingCursor
+                    />
+                  ) : (
+                    <MarkdownMessage
+                      content={
+                        renderedDraft?.content ||
+                        draftMessage.statusText ||
+                        "正在分析，请稍候..."
+                      }
+                    />
+                  )}
                 </div>
                 {isLoading && !renderedDraft?.content ? (
                   <div

@@ -503,8 +503,8 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
     async def runner():
         try:
             token = _request_id_var.set(req_id)
-            handler = OpsStreamHandler(queue)
             assistant_message_id = f"assistant-{req_id}"
+            handler = OpsStreamHandler(queue, assistant_message_id=assistant_message_id)
             
             now = datetime.now(timezone(timedelta(hours=8)))
             ops_req = OpsRequest(
@@ -520,6 +520,11 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
                 "event": "start",
                 "start": start.isoformat(),
                 "end": end.isoformat(),
+                "request_id": req_id,
+            })
+            await queue.put({
+                "event": "assistant_message_start",
+                "message_id": assistant_message_id,
                 "request_id": req_id,
             })
             
@@ -543,12 +548,6 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
                     "detail": "\n".join(next_actions),
                     "status": "failed",
                 }
-
-            await queue.put({
-                "event": "assistant_message_start",
-                "message_id": assistant_message_id,
-                "request_id": req_id,
-            })
 
             try:
                 rendered_content = await stream_rendered_answer(
