@@ -39,6 +39,8 @@ import {
   useOpsAgentStream,
   type StreamAgentMessage,
 } from "../hooks/useOpsAgentStream";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 const { Text } = Typography;
 
@@ -81,6 +83,42 @@ const TimelineBlock: React.FC<{ item: AgentTimelineItem }> = ({ item }) => {
         }}
       >
         🤔 {item.title || "思路摘要"}: {item.content}
+      </div>
+    );
+  }
+
+  if (item.kind === "node_failure") {
+    return (
+      <div
+        style={{
+          backgroundColor: "#fff2f0",
+          border: "1px solid #ffccc7",
+          borderRadius: 8,
+          padding: 12,
+          marginBottom: 8,
+        }}
+      >
+        <div style={{ color: "#cf1322", fontWeight: 600, marginBottom: 6 }}>
+          <CloseCircleOutlined style={{ marginRight: 6 }} />
+          {item.title}
+        </div>
+        <div style={{ color: "#595959", whiteSpace: "pre-wrap" }}>{item.message}</div>
+        {item.detail ? (
+          <pre
+            style={{
+              backgroundColor: "#fff",
+              color: "#8c8c8c",
+              padding: 8,
+              borderRadius: 4,
+              whiteSpace: "pre-wrap",
+              marginTop: 8,
+              marginBottom: 0,
+              border: "1px solid #ffd8bf",
+            }}
+          >
+            {item.detail}
+          </pre>
+        ) : null}
       </div>
     );
   }
@@ -188,6 +226,42 @@ const TimelineBlock: React.FC<{ item: AgentTimelineItem }> = ({ item }) => {
     </div>
   );
 };
+
+const MarkdownMessage: React.FC<{ content: string }> = ({ content }) => (
+  <div className="agent-markdown">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        p: ({ children }) => <p style={{ margin: "0 0 12px 0" }}>{children}</p>,
+        ul: ({ children }) => <ul style={{ margin: "0 0 12px 20px", padding: 0 }}>{children}</ul>,
+        ol: ({ children }) => <ol style={{ margin: "0 0 12px 20px", padding: 0 }}>{children}</ol>,
+        li: ({ children }) => <li style={{ marginBottom: 4 }}>{children}</li>,
+        h1: ({ children }) => <h1 style={{ fontSize: 20, margin: "0 0 12px 0" }}>{children}</h1>,
+        h2: ({ children }) => <h2 style={{ fontSize: 18, margin: "0 0 12px 0" }}>{children}</h2>,
+        h3: ({ children }) => <h3 style={{ fontSize: 16, margin: "0 0 12px 0" }}>{children}</h3>,
+        code: ({ children }) => (
+          <code
+            style={{
+              backgroundColor: "#f5f5f5",
+              padding: "2px 4px",
+              borderRadius: 4,
+              fontSize: "0.95em",
+            }}
+          >
+            {children}
+          </code>
+        ),
+        a: ({ href, children }) => (
+          <a href={href} target="_blank" rel="noreferrer">
+            {children}
+          </a>
+        ),
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  </div>
+);
 
 function buildRenderedContent(
   summary?: string,
@@ -689,9 +763,7 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
                             border: "1px solid #d9d9d9",
                           }}
                         >
-                          <div style={{ whiteSpace: "pre-wrap" }}>
-                            {agentRenderContent?.content || m.content}
-                          </div>
+                          <MarkdownMessage content={agentRenderContent?.content || m.content} />
                         </div>
                       </div>
                     )}
@@ -729,9 +801,7 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
                     border: "1px solid #d9d9d9",
                   }}
                 >
-                  <div style={{ whiteSpace: "pre-wrap" }}>
-                    {renderedDraft?.content || "正在分析，请稍候..."}
-                  </div>
+                  <MarkdownMessage content={renderedDraft?.content || "正在分析，请稍候..."} />
                 </div>
                 {isLoading && !renderedDraft?.content ? (
                   <div
@@ -750,7 +820,7 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
               </div>
             </div>
           )}
-          {error && (
+          {error && !draftMessage && (
             <div
               style={{
                 color: "#ff4d4f",

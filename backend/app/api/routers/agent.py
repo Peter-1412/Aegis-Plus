@@ -25,10 +25,10 @@ def utf8_slice(s: str, length: int) -> str:
 
 
 def build_rendered_content(summary: str, ranked_root_causes: list[dict], next_actions: list[str]) -> str:
-    parts = ["分析结论", summary.strip() or "暂无结论。"]
+    parts = ["## 分析结论", summary.strip() or "暂无结论。"]
 
     if ranked_root_causes:
-        lines = ["", "根因排查候选"]
+        lines = ["", "## 根因排查候选"]
         for idx, cause in enumerate(ranked_root_causes, start=1):
             description = str(cause.get("description") or "").strip()
             probability = cause.get("probability")
@@ -41,7 +41,7 @@ def build_rendered_content(summary: str, ranked_root_causes: list[dict], next_ac
         parts.extend(lines)
 
     if next_actions:
-        parts.extend(["", "后续建议"])
+        parts.extend(["", "## 后续建议"])
         parts.extend([f"- {str(action).strip()}" for action in next_actions if str(action).strip()])
 
     return "\n".join(parts).strip()
@@ -65,8 +65,8 @@ def build_render_prompt(summary: str, ranked_root_causes: list[dict], next_actio
         "你是一个智能运维助手。请把下面这份结构化排查结果改写成给用户直接展示的自然语言答复。\n"
         "要求：\n"
         "1. 使用中文。\n"
-        "2. 先给出明确结论，再给出根因候选和后续建议。\n"
-        "3. 不要输出 JSON，不要输出 Markdown 代码块。\n"
+        "2. 以 Markdown 正文输出，允许标题、列表、强调，但不要输出 Markdown 代码块。\n"
+        "3. 先给出明确结论，再给出根因候选和后续建议。\n"
         "4. 语气专业、简洁、可执行。\n"
         "5. 如果有多个根因候选，按可能性从高到低描述。\n\n"
         f"结构化结果：\n{payload_text}\n"
@@ -136,7 +136,49 @@ def build_timeline_payload(item: dict) -> dict | None:
             "resultSummary": item.get("result_summary"),
         }
 
+    if event_type == "node_failure":
+        return {
+            "id": item.get("node_id") or step_id,
+            "kind": "node_failure",
+            "title": item.get("title") or "当前节点失败",
+            "message": item.get("message") or "",
+            "detail": item.get("detail") or "",
+            "status": "failed",
+        }
+
     return None
+
+
+def build_failure_final_payload(
+    *,
+    req_id: str,
+    assistant_message_id: str,
+    summary: str,
+    detail: str,
+    next_actions: list[str],
+) -> dict:
+    return {
+        "event": "final",
+        "summary": summary,
+        "ranked_root_causes": [],
+        "next_actions": next_actions,
+        "trace": None,
+        "message_id": assistant_message_id,
+        "content": build_rendered_content(summary, [], next_actions),
+        "request_id": req_id,
+        "failure_detail": detail,
+        "timeline_seed": [
+            {
+                "event": "node_failure",
+                "node_id": f"node-failure-{req_id}",
+                "step_id": f"node-failure-{req_id}",
+                "title": "当前节点失败",
+                "message": summary,
+                "detail": detail,
+                "status": "failed",
+            }
+        ],
+    }
 
 @router.get("/sessions")
 def get_sessions(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
@@ -309,6 +351,17 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
                 ranked_root_causes,
                 next_actions,
             )
+            failure_seed = None
+            if (res.summary or "").startswith("当前节点已停止") or (res.summary or "").startswith("当前无法继续"):
+                failure_seed = {
+                    "event": "node_failure",
+                    "node_id": f"node-failure-{req_id}",
+                    "step_id": f"node-failure-{req_id}",
+                    "title": "当前节点失败",
+                    "message": res.summary,
+                    "detail": "\n".join(next_actions),
+                    "status": "failed",
+                }
 
             await queue.put({
                 "event": "assistant_message_start",
@@ -354,12 +407,26 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
                 "message_id": assistant_message_id,
                 "content": rendered_content,
                 "request_id": req_id,
+                "timeline_seed": [failure_seed] if failure_seed else [],
             }
             await queue.put(meta)
             
         except Exception as exc:
             logging.exception("ops stream error: %s", exc)
-            await queue.put({"event": "error", "message": str(exc), "request_id": req_id})
+            error_message = str(exc)
+            await queue.put(
+                build_failure_final_payload(
+                    req_id=req_id,
+                    assistant_message_id=assistant_message_id,
+                    summary="当前节点已停止运行。",
+                    detail=error_message,
+                    next_actions=[
+                        "根据失败原因修复环境、调整工具配置或缩小问题范围。",
+                        "如果你希望我继续深挖，请在下一轮明确说明“继续排查”或“继续深挖”。",
+                    ],
+                )
+            )
+            await queue.put({"event": "error", "message": error_message, "request_id": req_id})
         finally:
             try:
                 _request_id_var.reset(token)
@@ -392,12 +459,15 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
         while True:
             item = await queue.get()
             event_type = item.get("event")
+            for seed in item.get("timeline_seed") or []:
+                upsert_timeline(seed)
             if event_type in [
                 "thought_summary",
                 "tool_call_started",
                 "tool_call_running",
                 "tool_call_completed",
                 "tool_call_failed",
+                "node_failure",
             ]:
                 upsert_timeline(item)
 

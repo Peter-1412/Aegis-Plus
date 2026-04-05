@@ -77,6 +77,14 @@ export type AgentTimelineItem =
       resultState?: "ok" | "connectivity_blocked" | "no_data" | "runtime_error";
       resultSummary?: string;
       meta?: AgentLinkMeta;
+    }
+  | {
+      id: string;
+      kind: "node_failure";
+      title: string;
+      message: string;
+      detail?: string;
+      status: "failed";
     };
 
 export type AgentRootCause = {

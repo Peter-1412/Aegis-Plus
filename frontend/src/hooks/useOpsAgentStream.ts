@@ -169,6 +169,19 @@ export function useOpsAgentStream() {
                 }));
                 break;
 
+              case 'node_failure':
+                ensureDraft((draft) => ({
+                  ...upsertTimeline(draft, {
+                    id: data.node_id || data.step_id || crypto.randomUUID(),
+                    kind: 'node_failure',
+                    title: data.title || '当前节点失败',
+                    message: data.message || '当前节点已停止。',
+                    detail: data.detail || '',
+                    status: 'failed',
+                  }),
+                }));
+                break;
+
               case 'assistant_message_start':
                 ensureDraft((draft) => ({
                   ...draft,
@@ -205,9 +218,17 @@ export function useOpsAgentStream() {
                 break;
 
               case 'error':
-                if (!data.step_id) {
-                  setError(data.message || data.error_message || '分析失败');
-                }
+                ensureDraft((draft) => ({
+                  ...upsertTimeline(draft, {
+                    id: data.step_id || `node-error-${Date.now()}`,
+                    kind: 'node_failure',
+                    title: '当前节点失败',
+                    message: data.message || data.error_message || '分析失败',
+                    detail: data.error_message || data.message || '',
+                    status: 'failed',
+                  }),
+                }));
+                setError(data.message || data.error_message || '分析失败');
                 break;
             }
           } catch (parseError) {
