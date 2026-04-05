@@ -72,6 +72,72 @@ def build_render_prompt(summary: str, ranked_root_causes: list[dict], next_actio
         f"结构化结果：\n{payload_text}\n"
     )
 
+
+def build_timeline_payload(item: dict) -> dict | None:
+    event_type = item.get("event")
+    step_id = item.get("step_id")
+    if not step_id:
+        return None
+
+    if event_type == "thought_summary":
+        return {
+            "id": step_id,
+            "kind": "thought_summary",
+            "title": item.get("title") or "思路摘要",
+            "content": item.get("thought") or "",
+            "phase": item.get("workflow_stage") or "planning",
+            "status": "completed",
+        }
+
+    if event_type == "tool_call_started":
+        return {
+            "id": step_id,
+            "kind": "tool_call",
+            "toolName": item.get("tool") or "",
+            "status": item.get("status") or "started",
+            "inputText": item.get("tool_input") or "",
+            "outputText": "",
+            "resultState": item.get("result_state"),
+            "resultSummary": item.get("result_summary"),
+            "meta": item.get("meta") or {},
+        }
+
+    if event_type == "tool_call_running":
+        return {
+            "id": step_id,
+            "kind": "tool_call",
+            "toolName": item.get("tool") or "",
+            "status": "running",
+            "inputText": item.get("tool_input") or "",
+            "resultState": item.get("result_state"),
+            "resultSummary": item.get("result_summary"),
+            "meta": item.get("meta") or {},
+        }
+
+    if event_type == "tool_call_completed":
+        return {
+            "id": step_id,
+            "kind": "tool_call",
+            "toolName": item.get("tool") or "",
+            "status": "completed",
+            "outputText": item.get("observation") or "",
+            "resultState": item.get("result_state") or "ok",
+            "resultSummary": item.get("result_summary"),
+        }
+
+    if event_type in {"tool_call_failed"}:
+        return {
+            "id": step_id,
+            "kind": "tool_call",
+            "toolName": item.get("tool") or "",
+            "status": "failed",
+            "outputText": item.get("error_message") or item.get("message") or "",
+            "resultState": item.get("result_state") or "runtime_error",
+            "resultSummary": item.get("result_summary"),
+        }
+
+    return None
+
 @router.get("/sessions")
 def get_sessions(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     sessions = session.exec(
@@ -304,64 +370,50 @@ async def chat_stream(req: ChatRequest, response: Response, current_user: User =
     asyncio.create_task(runner())
 
     async def iterator() -> AsyncIterator[bytes]:
-        step_map: dict[str, dict] = {}
-        step_order: list[str] = []
+        timeline_map: dict[str, dict] = {}
+        timeline_order: list[str] = []
 
-        def upsert_step(item: dict):
-            event_type = item.get("event")
-            step_id = item.get("step_id")
-            if not step_id:
+        def upsert_timeline(item: dict):
+            payload = build_timeline_payload(item)
+            if not payload:
                 return
-            if event_type == "agent_thought":
-                if step_id not in step_map:
-                    step_order.append(step_id)
-                step_map[step_id] = {
-                    "id": step_id,
-                    "type": "thought",
-                    "content": item.get("thought") or "",
-                    "status": "success",
-                }
-            elif event_type == "tool_start":
-                if step_id not in step_map:
-                    step_order.append(step_id)
-                step_map[step_id] = {
-                    "id": step_id,
-                    "type": "tool",
-                    "content": item.get("tool") or "",
-                    "toolInput": item.get("tool_input") or "",
-                    "toolOutput": "",
-                    "status": "pending",
-                }
-            elif event_type == "tool_end":
-                step = step_map.get(step_id)
-                if step:
-                    step["toolOutput"] = item.get("observation") or ""
-                    step["status"] = "success"
-            elif event_type == "error":
-                step = step_map.get(step_id)
-                if step:
-                    step["toolOutput"] = item.get("error_message") or item.get("message") or ""
-                    step["status"] = "error"
+            timeline_id = payload["id"]
+            existing = timeline_map.get(timeline_id)
+            if timeline_id not in timeline_map:
+                timeline_order.append(timeline_id)
+                timeline_map[timeline_id] = payload
+                return
+
+            if existing and payload["kind"] == "tool_call" and existing.get("kind") == "tool_call":
+                existing.update({k: v for k, v in payload.items() if v not in (None, "", {})})
+            else:
+                timeline_map[timeline_id] = payload
 
         while True:
             item = await queue.get()
             event_type = item.get("event")
-            if event_type in ["agent_thought", "tool_start", "tool_end", "error"]:
-                upsert_step(item)
+            if event_type in [
+                "thought_summary",
+                "tool_call_started",
+                "tool_call_running",
+                "tool_call_completed",
+                "tool_call_failed",
+            ]:
+                upsert_timeline(item)
 
             if event_type == "final":
                 ranked_root_causes = item.get("ranked_root_causes") or []
                 next_actions = item.get("next_actions") or []
-                steps = [step_map[step_id] for step_id in step_order if step_id in step_map]
+                timeline = [timeline_map[item_id] for item_id in timeline_order if item_id in timeline_map]
                 structured_content = {
-                    "version": 2,
+                    "version": 3,
                     "content": item.get("content") or "",
                     "summary": item.get("summary"),
                     "ranked_root_causes": ranked_root_causes,
                     "next_actions": next_actions,
-                    "steps": steps,
+                    "timeline": timeline,
                 }
-                final_payload = {**item, "steps": steps}
+                final_payload = {**item, "timeline": timeline}
                 yield (json.dumps(final_payload, ensure_ascii=False) + "\n").encode("utf-8")
 
                 from app.db.session import engine

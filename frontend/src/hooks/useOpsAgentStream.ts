@@ -1,5 +1,5 @@
 import { useCallback, useState } from 'react';
-import type { AgentRootCause, AgentStep } from '../types';
+import type { AgentRootCause, AgentTimelineItem } from '../types';
 
 export interface StreamAgentMessage {
   id: string;
@@ -9,7 +9,7 @@ export interface StreamAgentMessage {
   summary?: string;
   ranked_root_causes: AgentRootCause[];
   next_actions: string[];
-  steps: AgentStep[];
+  timeline: AgentTimelineItem[];
 }
 
 function createDraftMessage(id: string): StreamAgentMessage {
@@ -20,7 +20,7 @@ function createDraftMessage(id: string): StreamAgentMessage {
     createdAt: new Date().toISOString(),
     ranked_root_causes: [],
     next_actions: [],
-    steps: [],
+    timeline: [],
   };
 }
 
@@ -67,6 +67,19 @@ export function useOpsAgentStream() {
         setDraftMessage((prev) => updater(prev ?? createDraftMessage(initialDraftId)));
       };
 
+      const upsertTimeline = (
+        draft: StreamAgentMessage,
+        item: AgentTimelineItem,
+      ): StreamAgentMessage => {
+        const existingIndex = draft.timeline.findIndex((timelineItem) => timelineItem.id === item.id);
+        if (existingIndex === -1) {
+          return { ...draft, timeline: [...draft.timeline, item] };
+        }
+        const nextTimeline = [...draft.timeline];
+        nextTimeline[existingIndex] = { ...nextTimeline[existingIndex], ...item } as AgentTimelineItem;
+        return { ...draft, timeline: nextTimeline };
+      };
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -82,51 +95,77 @@ export function useOpsAgentStream() {
             const data = JSON.parse(line);
 
             switch (data.event) {
-              case 'agent_thought':
+              case 'thought_summary':
                 ensureDraft((draft) => ({
-                  ...draft,
-                  steps: [
-                    ...draft.steps,
-                    {
-                      id: data.step_id || crypto.randomUUID(),
-                      type: 'thought',
-                      content: data.thought || '',
-                      status: 'success',
-                    },
-                  ],
+                  ...upsertTimeline(draft, {
+                    id: data.step_id || crypto.randomUUID(),
+                    kind: 'thought_summary',
+                    title: data.title || '思路摘要',
+                    content: data.thought || '',
+                    phase: data.workflow_stage || 'planning',
+                    status: 'completed',
+                  }),
                 }));
                 break;
 
-              case 'tool_start':
+              case 'tool_call_started':
                 ensureDraft((draft) => {
                   const stepId = data.step_id || crypto.randomUUID();
-                  if (draft.steps.some((step) => step.id === stepId)) {
-                    return draft;
-                  }
-                  return {
-                    ...draft,
-                    steps: [
-                      ...draft.steps,
-                      {
-                        id: stepId,
-                        type: 'tool',
-                        content: data.tool || '',
-                        toolInput: data.tool_input || '',
-                        status: 'pending',
-                      },
-                    ],
-                  };
+                  return upsertTimeline(draft, {
+                    id: stepId,
+                    kind: 'tool_call',
+                    toolName: data.tool || '',
+                    inputText: data.tool_input || '',
+                    outputText: '',
+                    meta: data.meta || {},
+                    resultState: data.result_state,
+                    resultSummary: data.result_summary,
+                    status: data.status || 'started',
+                  });
                 });
                 break;
 
-              case 'tool_end':
+              case 'tool_call_running':
+                ensureDraft((draft) => {
+                  const stepId = data.step_id || crypto.randomUUID();
+                  return upsertTimeline(draft, {
+                    id: stepId,
+                    kind: 'tool_call',
+                    toolName: data.tool || '',
+                    inputText: data.tool_input || '',
+                    meta: data.meta || {},
+                    resultState: data.result_state,
+                    resultSummary: data.result_summary,
+                    status: 'running',
+                  });
+                });
+                break;
+
+              case 'tool_call_completed':
                 ensureDraft((draft) => ({
-                  ...draft,
-                  steps: draft.steps.map((step) =>
-                    step.id === data.step_id
-                      ? { ...step, toolOutput: data.observation || '', status: 'success' }
-                      : step,
-                  ),
+                  ...upsertTimeline(draft, {
+                    id: data.step_id || crypto.randomUUID(),
+                    kind: 'tool_call',
+                    toolName: data.tool || '',
+                    outputText: data.observation || '',
+                    resultState: data.result_state || 'ok',
+                    resultSummary: data.result_summary,
+                    status: 'completed',
+                  }),
+                }));
+                break;
+
+              case 'tool_call_failed':
+                ensureDraft((draft) => ({
+                  ...upsertTimeline(draft, {
+                    id: data.step_id || crypto.randomUUID(),
+                    kind: 'tool_call',
+                    toolName: data.tool || '',
+                    outputText: data.error_message || data.message || '执行失败',
+                    resultState: data.result_state || 'runtime_error',
+                    resultSummary: data.result_summary,
+                    status: 'failed',
+                  }),
                 }));
                 break;
 
@@ -161,25 +200,12 @@ export function useOpsAgentStream() {
                   summary: data.summary || '',
                   ranked_root_causes: data.ranked_root_causes || [],
                   next_actions: data.next_actions || [],
-                  steps: Array.isArray(data.steps) ? data.steps : draft.steps,
+                  timeline: Array.isArray(data.timeline) ? data.timeline : draft.timeline,
                 }));
                 break;
 
               case 'error':
-                if (data.step_id) {
-                  ensureDraft((draft) => ({
-                    ...draft,
-                    steps: draft.steps.map((step) =>
-                      step.id === data.step_id
-                        ? {
-                            ...step,
-                            status: 'error',
-                            toolOutput: data.error_message || data.message || '执行失败',
-                          }
-                        : step,
-                    ),
-                  }));
-                } else {
+                if (!data.step_id) {
                   setError(data.message || data.error_message || '分析失败');
                 }
                 break;

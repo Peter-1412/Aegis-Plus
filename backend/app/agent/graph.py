@@ -1,4 +1,4 @@
-from typing import TypedDict, Annotated, List, Tuple, Any, Optional
+from typing import TypedDict, Annotated, List, Tuple
 import operator
 import json
 import logging
@@ -8,9 +8,6 @@ from langchain_core.messages import BaseMessage
 
 from app.agent.llm import get_llm
 from app.agent.executor import build_executor
-from app.tools import build_tools
-from app.tools.loki_tool import LokiClient
-from config.config import settings
 
 class AgentState(TypedDict):
     input: str
@@ -24,30 +21,56 @@ class AgentState(TypedDict):
     pending_confirmation: str # "plan" or "step"
     user_feedback: str
     chat_history: List[BaseMessage] # Added to retain multi-turn context
+    abort_reason: str
 
 from langchain_core.runnables.config import RunnableConfig
 
-DIAGNOSIS_KEYWORDS = [
-    "分析",
-    "排查",
-    "故障",
-    "异常",
-    "报错",
-    "为什么",
-    "哪里",
-    "看下",
-    "看看",
-    "根因",
-    "慢",
-    "502",
-    "503",
-    "超时",
+DEEP_DIVE_KEYWORDS = [
+    "继续排查",
+    "继续分析",
+    "继续深挖",
+    "深入排查",
+    "深入分析",
+    "详细排查",
+    "进一步排查",
+    "进一步分析",
+    "继续查",
+    "深挖",
+    "深入",
+]
+
+CONNECTIVITY_ERROR_MARKERS = [
+    "prometheus_request_failed",
+    "jaeger_request_failed",
+    "connection refused",
+    "failed to establish a new connection",
+    "name or service not known",
+    "nodename nor servname provided",
+    "temporary failure in name resolution",
+    "timed out",
+    "timeout",
+    "k8s client not initialized",
+    "无法连接到 kubernetes 集群",
+    "failed to load kubernetes config",
 ]
 
 
 def _get_stream_handler(config: RunnableConfig):
-    callbacks = config.get("callbacks") or []
-    for callback in callbacks:
+    configurable = config.get("configurable") or {}
+    stream_handler = configurable.get("stream_handler")
+    if stream_handler and hasattr(stream_handler, "emit_agent_thought"):
+        return stream_handler
+
+    callbacks = config.get("callbacks")
+    if callbacks is None:
+        callback_list = []
+    elif isinstance(callbacks, (list, tuple)):
+        callback_list = list(callbacks)
+    elif hasattr(callbacks, "handlers"):
+        callback_list = list(getattr(callbacks, "handlers") or [])
+    else:
+        callback_list = [callbacks]
+    for callback in callback_list:
         if hasattr(callback, "emit_agent_thought"):
             return callback
     return None
@@ -59,50 +82,69 @@ async def _emit_thought(config: RunnableConfig, thought: str):
         await handler.emit_agent_thought(thought)
 
 
-def _looks_complex_request(text: str) -> bool:
+def _stringify_observation(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return str(value)
+
+
+def _detect_connectivity_blocker(intermediate_steps) -> str | None:
+    for pair in intermediate_steps or []:
+        try:
+            action, observation = pair
+        except Exception:
+            continue
+        tool_name = str(getattr(action, "tool", "") or "未知工具")
+        observation_text = _stringify_observation(observation)
+        lowered = observation_text.lower()
+        if any(marker in lowered for marker in CONNECTIVITY_ERROR_MARKERS):
+            return f"{tool_name} 无法访问基础环境，可能未连接 VPN、未配置 kubeconfig，或监控/链路服务不可达。"
+    return None
+
+
+def _build_abort_response(summary: str, next_actions: list[str]) -> str:
+    return json.dumps(
+        {
+            "summary": summary,
+            "ranked_root_causes": [],
+            "next_actions": next_actions,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _looks_deep_dive_request(text: str) -> bool:
     lowered = (text or "").lower()
-    return any(keyword in lowered for keyword in DIAGNOSIS_KEYWORDS)
+    return any(keyword in lowered for keyword in DEEP_DIVE_KEYWORDS)
+
+
+def _detect_execution_failure(text: str | None) -> str | None:
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+    if "could not parse llm output" in lowered or "output_parsing_failure" in lowered:
+        return "模型返回了不可解析的工具调用格式，当前节点已停止。"
+    if "执行失败" in text or "失败" in text:
+        return text or "当前工具节点执行失败。"
+    return None
 
 async def classify_task(state: AgentState, config: RunnableConfig) -> dict:
     current_input = state.get("input", "")
-    if _looks_complex_request(current_input):
-        await _emit_thought(config, "识别到故障排查类请求，进入多步诊断流程。")
-        return {"task_type": "complex"}
-
-    llm = get_llm(state["model_name"])
-    
-    # 构建包含历史记录的 prompt
-    history_text = ""
-    if state.get("chat_history"):
-        history_text = "历史对话：\n" + "\n".join([f"{m.type}: {m.content}" for m in state["chat_history"][-4:]]) + "\n\n"
-
-    prompt = (
-        "你是一个智能运维助手。请分析以下用户的请求，判断它是需要多步排查和规划的复杂任务，还是只需单次查询或简单回复的简单任务。\n"
-        "如果包含'查一下'、'获取'、'打招呼'等简单指令且不涉及多服务或深层根因，则是 simple。\n"
-        "如果是'分析故障'、'为什么'、'根因'、'排查'等，则是 complex。\n"
-        f"{history_text}"
-        f"当前请求：{state['input']}\n"
-        "只需回答 'simple' 或 'complex'。"
-    )
-    try:
-        res = await llm.ainvoke(prompt, config=config)
-        task_type = res.content.strip().lower()
-        if "complex" in task_type:
-            task_type = "complex"
-        else:
-            task_type = "simple"
-    except Exception as e:
-        logging.warning(f"Classify failed, fallback to complex: {e}")
-        task_type = "complex"
-        
-    return {"task_type": task_type}
+    if _looks_deep_dive_request(current_input):
+        await _emit_thought(config, "识别到用户要求继续深挖，进入下一轮计划。")
+        return {"task_type": "deep_dive"}
+    await _emit_thought(config, "优先按单轮工具查询处理当前请求。")
+    return {"task_type": "direct"}
 
 def route_after_classify(state: AgentState) -> str:
-    return "react_agent" if state.get("task_type") == "simple" else "planner"
+    return "planner" if state.get("task_type") == "deep_dive" else "react_agent"
 
 async def react_agent_node(state: AgentState, config: RunnableConfig) -> dict:
-    loki = LokiClient(settings.loki_base_url, settings.loki_tenant_id, settings.request_timeout_s)
-    tools = build_tools(loki)
     llm = get_llm(state["model_name"])
     
     # 构建一个虚拟的 Memory 对象来传递 chat_history
@@ -114,65 +156,90 @@ async def react_agent_node(state: AgentState, config: RunnableConfig) -> dict:
 
     executor = build_executor(llm, memory)
     
-    await _emit_thought(config, "开始执行单轮查询，优先使用工具收集可验证证据。")
-    res = await executor.ainvoke(
-        {
-            "input": (
-                f"{state['input']}\n\n"
-                "要求：如果请求涉及系统状态、日志、指标、链路或故障原因，必须先调用至少一个工具，"
-                "不要直接凭经验作答。"
-            )
-        },
-        config=config,
+    await _emit_thought(config, "开始执行单轮查询，优先使用最相关的工具收集证据。")
+    try:
+        res = await executor.ainvoke(
+            {
+                "input": (
+                    f"{state['input']}\n\n"
+                    "要求：\n"
+                    "1. 优先只调用一个最相关的工具完成当前查询。\n"
+                    "2. 只有第一个工具结果明显不足时，才允许追加下一个工具。\n"
+                    "3. 如果工具失败、环境不可达或输出无法解析，立即停止当前节点并说明失败原因。\n"
+                    "4. 不要自行扩展为多步排查计划。"
+                )
+            },
+            config=config,
+        )
+    except Exception as exc:
+        blocker = _detect_connectivity_blocker([(None, str(exc))]) or _detect_execution_failure(str(exc))
+        if blocker:
+            await _emit_thought(config, f"当前节点失败，停止继续调用工具。{blocker}")
+            return {
+                "response": _build_abort_response(
+                    f"当前节点已停止。{blocker}",
+                    [
+                        "根据上面的失败原因修复环境或调整提问。",
+                        "如果你希望我继续深挖，请在下一轮明确说明“继续排查”或“继续深挖”。",
+                    ],
+                ),
+                "abort_reason": blocker,
+            }
+        raise
+    blocker = (
+        _detect_connectivity_blocker(res.get("intermediate_steps"))
+        or _detect_connectivity_blocker([(None, res.get("output", ""))])
+        or _detect_execution_failure(res.get("output", ""))
     )
+    if blocker:
+        await _emit_thought(config, f"当前节点失败，停止继续调用工具。{blocker}")
+        return {
+            "response": _build_abort_response(
+                f"当前节点已停止。{blocker}",
+                [
+                    "根据上面的失败原因修复环境或调整提问。",
+                    "如果你希望我继续深挖，请在下一轮明确说明“继续排查”或“继续深挖”。",
+                ],
+            ),
+            "abort_reason": blocker,
+        }
     return {"response": res.get("output", "")}
 
 async def planner_node(state: AgentState, config: RunnableConfig) -> dict:
     llm = get_llm(state["model_name"])
-    await _emit_thought(config, "正在生成排查计划，随后会按步骤调用工具收集证据。")
+    await _emit_thought(config, "正在生成下一轮深挖计划，本轮只推进一步。")
     
-    if state.get("past_steps"):
-        context = "\n".join([f"步骤: {s}\n结果: {r}" for s, r in state["past_steps"]])
-        prompt = (
-            "你是一个高级运维专家。之前的排查计划在执行中遇到失败，请根据已有进展，重新生成后续的排查计划。\n"
-            "要求：\n"
-            "1. 每行一个步骤，不要有额外内容或编号前缀。\n"
-            "2. 步骤要具体、可执行。\n"
-            f"初始请求：{state['input']}\n\n"
-            f"已执行的步骤和结果：\n{context}\n\n"
-            "请给出下一步及之后的排查计划："
-        )
-    else:
-        prompt = (
-            "你是一个高级运维专家。请为以下运维请求生成一个分步执行的排查计划。\n"
-            "要求：\n"
-            "1. 每行一个步骤，不要有额外内容或编号前缀（如 1. 2. 等，只需文字描述）。\n"
-            "2. 步骤要具体、可执行。\n"
-            f"请求：{state['input']}"
-        )
+    context = ""
+    if state.get("chat_history"):
+        context = "\n".join([f"{m.type}: {m.content}" for m in state["chat_history"][-6:]])
+    prompt = (
+        "你是一个高级运维专家。用户明确要求继续深挖，请只生成“下一步最有价值的一步排查动作”。\n"
+        "要求：\n"
+        "1. 只输出一行，不要编号，不要多步骤。\n"
+        "2. 这一步必须是可以直接执行的排查动作。\n"
+        "3. 不要生成完整多步计划。\n"
+        f"当前请求：{state['input']}\n"
+        f"历史上下文：\n{context}"
+    )
         
     res = await llm.ainvoke(prompt, config=config)
-    plan = [line.strip().lstrip("0123456789.-* ") for line in res.content.split("\n") if line.strip()]
+    plan = [line.strip().lstrip("0123456789.-* ") for line in res.content.split("\n") if line.strip()][:1]
     if plan:
-        await _emit_thought(config, f"已生成 {len(plan)} 个排查步骤，开始依次执行。")
-    
-    # 如果是飞书会话，主动发送一条消息告知计划，但不中断执行
-    chat_id = state.get("session_id", "")
-    if chat_id.startswith("ou_") or chat_id.startswith("oc_"):
-        try:
-            from app.interface.feishu_client import feishu_client
-            import asyncio
-            plan_str = "\n".join([f"- {p}" for p in plan])
-            msg = f"已为您生成排查计划，正在自动执行中...\n\n计划内容：\n{plan_str}"
-            asyncio.create_task(feishu_client.send_text_message(chat_id=chat_id, text=msg))
-        except Exception as e:
-            logging.error(f"Failed to send plan to feishu: {e}")
-
-    return {"plan": plan, "current_step_index": 0, "pending_confirmation": ""}
+        await _emit_thought(config, "已生成下一步深挖动作，开始执行本轮唯一一步。")
+        return {"plan": plan, "current_step_index": 0, "pending_confirmation": "", "abort_reason": ""}
+    return {
+        "response": _build_abort_response(
+            "当前未能生成可执行的下一步深挖动作。",
+            [
+                "请补充更明确的目标，例如服务名、时间范围或错误现象。",
+                "如果只需要当前结果，请直接基于现有答案处理。",
+            ],
+        ),
+        "abort_reason": "未生成可执行步骤",
+    }
 
 def route_after_planner(state: AgentState) -> str:
-    # 直接进入执行阶段，不再中断等待计划确认
-    return "execute_step"
+    return "generate_report" if state.get("abort_reason") else "execute_step"
 
 async def execute_step_node(state: AgentState, config: RunnableConfig) -> dict:
     if state["current_step_index"] >= len(state["plan"]):
@@ -181,23 +248,10 @@ async def execute_step_node(state: AgentState, config: RunnableConfig) -> dict:
     step = state["plan"][state["current_step_index"]]
     await _emit_thought(config, f"开始执行步骤：{step}")
     
-    # If user provided feedback
     if state.get("user_feedback"):
         feedback = state["user_feedback"].strip().lower()
         logging.info(f"User feedback received: {feedback}")
-        
-        if state.get("pending_confirmation") == "plan":
-            if "不" in feedback or "no" in feedback or "停止" in feedback or "取消" in feedback:
-                return {
-                    "user_feedback": "",
-                    "pending_confirmation": "",
-                    "current_step_index": len(state["plan"]) # Skip all steps
-                }
-            else:
-                # Plan confirmed, clear feedback, but continue to evaluate step
-                state["user_feedback"] = ""
-                state["pending_confirmation"] = ""
-        elif state.get("pending_confirmation") == "step":
+        if state.get("pending_confirmation") == "step":
             if "不" in feedback or "no" in feedback or "停止" in feedback or "取消" in feedback:
                 return {
                     "user_feedback": "",
@@ -213,8 +267,6 @@ async def execute_step_node(state: AgentState, config: RunnableConfig) -> dict:
     if is_high_risk and state.get("pending_confirmation") != "step_confirmed":
         return {"pending_confirmation": "step", "user_feedback": ""}
 
-    loki = LokiClient(settings.loki_base_url, settings.loki_tenant_id, settings.request_timeout_s)
-    tools = build_tools(loki)
     llm = get_llm(state["model_name"])
     executor = build_executor(llm, None)
     
@@ -224,42 +276,66 @@ async def execute_step_node(state: AgentState, config: RunnableConfig) -> dict:
         f"之前执行的步骤和结果:\n{context}\n\n"
         f"当前需执行的步骤: {step}\n"
         "要求：\n"
-        "1. 必须调用至少一个最相关的工具来收集证据，不允许直接凭空回答。\n"
-        "2. 若一个工具不够，请继续调用后再总结结果。\n"
-        "3. 返回内容应基于工具结果，简洁说明执行结果和证据。\n"
+        "1. 优先调用一个最相关的工具完成这一轮深挖。\n"
+        "2. 如果工具失败、环境不可达或输出不可解析，立即停止当前节点。\n"
+        "3. 不要扩展为新的多步计划。\n"
+        "4. 返回内容应基于工具结果，简洁说明执行结果和证据。\n"
         "请执行该步骤，并返回执行结果。"
     )
     
     try:
         res = await executor.ainvoke({"input": prompt}, config=config)
         result = res.get("output", "")
+        blocker = _detect_connectivity_blocker(res.get("intermediate_steps")) or _detect_connectivity_blocker([(None, result)])
+        failure = _detect_execution_failure(result)
+        blocker = blocker or failure
+        if blocker:
+            await _emit_thought(config, f"当前节点失败，停止本轮深挖。{blocker}")
+            return {
+                "past_steps": [(step, result or blocker)],
+                "current_step_index": len(state["plan"]),
+                "pending_confirmation": "",
+                "user_feedback": "",
+                "abort_reason": blocker,
+            }
     except Exception as e:
         result = f"执行失败: {e}"
+        blocker = _detect_connectivity_blocker([(None, result)]) or _detect_execution_failure(result)
+        if blocker:
+            await _emit_thought(config, f"当前节点失败，停止本轮深挖。{blocker}")
+            return {
+                "past_steps": [(step, result)],
+                "current_step_index": len(state["plan"]),
+                "pending_confirmation": "",
+                "user_feedback": "",
+                "abort_reason": blocker,
+            }
         
     return {
         "past_steps": [(step, result)],
-        "current_step_index": state["current_step_index"] + 1,
+        "current_step_index": len(state["plan"]),
         "pending_confirmation": "",
-        "user_feedback": ""
+        "user_feedback": "",
+        "abort_reason": "",
     }
 
 def route_after_execute(state: AgentState) -> str:
     if state.get("pending_confirmation") == "step":
         return "wait_for_confirmation"
-        
-    # Check if last step failed, if so, replan
-    if state.get("past_steps"):
-        last_step, last_result = state["past_steps"][-1]
-        if "执行失败" in last_result or "失败" in last_result:
-            # simple fallback: go back to planner to replan
-            # In a real scenario we might have a dedicated 'replanner' node
-            return "planner"
-
-    if state["current_step_index"] >= len(state["plan"]):
-        return "generate_report"
-    return "execute_step"
+    return "generate_report"
 
 async def generate_report_node(state: AgentState, config: RunnableConfig) -> dict:
+    if state.get("abort_reason"):
+        return {
+            "response": _build_abort_response(
+                f"当前节点已停止。{state['abort_reason']}",
+                [
+                    "根据上面的失败原因修复环境或调整提问。",
+                    "如果你希望我继续深挖，请在下一轮明确说明“继续排查”或“继续深挖”。",
+                ],
+            )
+        }
+
     llm = get_llm(state["model_name"])
     context = "\n".join([f"步骤: {s}\n结果: {r}" for s, r in state.get("past_steps", [])])
     prompt = (

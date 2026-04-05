@@ -48,14 +48,36 @@ export type AgentMessage = {
   createdAt: string;
 };
 
-export type AgentStep = {
-  id: string;
-  type: "thought" | "tool";
-  content: string;
-  toolInput?: string;
-  toolOutput?: string;
-  status: "pending" | "success" | "error";
+export type AgentLinkMeta = {
+  path?: string;
+  lineStart?: number;
+  lineEnd?: number;
+  terminalId?: string;
+  commandId?: string;
+  previewUrl?: string;
+  url?: string;
 };
+
+export type AgentTimelineItem =
+  | {
+      id: string;
+      kind: "thought_summary";
+      title?: string;
+      content: string;
+      phase?: string;
+      status: "completed";
+    }
+  | {
+      id: string;
+      kind: "tool_call";
+      toolName: string;
+      status: "started" | "running" | "completed" | "failed";
+      inputText?: string;
+      outputText?: string;
+      resultState?: "ok" | "connectivity_blocked" | "no_data" | "runtime_error";
+      resultSummary?: string;
+      meta?: AgentLinkMeta;
+    };
 
 export type AgentRootCause = {
   rank: number;
@@ -70,7 +92,7 @@ export type AgentStructuredMessage = {
   summary?: string;
   ranked_root_causes?: AgentRootCause[];
   next_actions?: string[];
-  steps?: AgentStep[] | unknown[];
+  timeline?: AgentTimelineItem[];
 };
 
 export type DashboardOverview = {

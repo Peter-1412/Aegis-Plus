@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  AgentLinkMeta,
   AgentMessage,
   AgentRootCause,
   AgentSession,
-  AgentStep,
   AgentStructuredMessage,
+  AgentTimelineItem,
   User,
 } from "../types/index";
 import {
@@ -48,13 +49,27 @@ type ChatPageProps = {
 
 type AgentRenderContent = {
   content: string;
-  steps: AgentStep[];
+  timeline: AgentTimelineItem[];
 };
 
-const StepBlock: React.FC<{ step: AgentStep }> = ({ step }) => {
+const MetaLinks: React.FC<{ meta?: AgentLinkMeta }> = ({ meta }) => {
+  if (!meta) return null;
+  const chips: string[] = [];
+  if (meta.path) {
+    chips.push(meta.lineStart ? `${meta.path}:${meta.lineStart}${meta.lineEnd ? `-${meta.lineEnd}` : ""}` : meta.path);
+  }
+  if (meta.terminalId) chips.push(`terminal ${meta.terminalId}`);
+  if (meta.commandId) chips.push(`command ${meta.commandId}`);
+  if (meta.previewUrl) chips.push(meta.previewUrl);
+  if (meta.url) chips.push(meta.url);
+  if (!chips.length) return null;
+  return <div style={{ fontSize: "12px", color: "#8c8c8c", marginTop: 8 }}>{chips.join(" | ")}</div>;
+};
+
+const TimelineBlock: React.FC<{ item: AgentTimelineItem }> = ({ item }) => {
   const [expanded, setExpanded] = useState(false);
 
-  if (step.type === "thought") {
+  if (item.kind === "thought_summary") {
     return (
       <div
         style={{
@@ -65,7 +80,7 @@ const StepBlock: React.FC<{ step: AgentStep }> = ({ step }) => {
           borderLeft: "2px solid #91d5ff",
         }}
       >
-        🤔 思考中: {step.content}
+        🤔 {item.title || "思路摘要"}: {item.content}
       </div>
     );
   }
@@ -93,14 +108,18 @@ const StepBlock: React.FC<{ step: AgentStep }> = ({ step }) => {
         onClick={() => setExpanded(!expanded)}
       >
         <span style={{ fontFamily: "monospace", color: "#595959" }}>
-          <ToolOutlined style={{ marginRight: 6 }} /> 调用工具: <span style={{ fontWeight: 'bold', color: '#1890ff' }}>{step.content}</span>
+          <ToolOutlined style={{ marginRight: 6 }} /> 调用工具: <span style={{ fontWeight: 'bold', color: '#1890ff' }}>{item.toolName}</span>
         </span>
         <span style={{ fontSize: "12px", color: "#8c8c8c" }}>
-          {step.status === "pending" ? (
+          {item.status === "started" ? (
+            <>
+              <Spin size="small" style={{ marginRight: 4 }} /> 已创建
+            </>
+          ) : item.status === "running" ? (
             <>
               <Spin size="small" style={{ marginRight: 4 }} /> 运行中...
             </>
-          ) : step.status === "success" ? (
+          ) : item.status === "completed" ? (
             <>
               <CheckCircleOutlined style={{ color: "#52c41a" }} /> 完成
             </>
@@ -114,6 +133,17 @@ const StepBlock: React.FC<{ step: AgentStep }> = ({ step }) => {
 
       {expanded && (
         <div style={{ padding: 12, borderTop: "1px solid #f0f0f0" }}>
+          {item.resultSummary ? (
+            <div
+              style={{
+                marginBottom: 8,
+                fontSize: "12px",
+                color: item.resultState === "connectivity_blocked" || item.resultState === "runtime_error" ? "#cf1322" : "#8c8c8c",
+              }}
+            >
+              结果判定: {item.resultSummary}
+            </div>
+          ) : null}
           <div style={{ marginBottom: 8 }}>
             <div style={{ fontSize: "12px", color: "#8c8c8c", marginBottom: 4 }}>
               输入参数:
@@ -128,10 +158,10 @@ const StepBlock: React.FC<{ step: AgentStep }> = ({ step }) => {
                 margin: 0,
               }}
             >
-              {step.toolInput || "无"}
+              {item.inputText || "无"}
             </pre>
           </div>
-          {step.toolOutput && (
+          {item.outputText && (
             <div>
               <div style={{ fontSize: "12px", color: "#8c8c8c", marginBottom: 4 }}>
                 返回结果:
@@ -148,10 +178,11 @@ const StepBlock: React.FC<{ step: AgentStep }> = ({ step }) => {
                   margin: 0,
                 }}
               >
-                {step.toolOutput}
+                {item.outputText}
               </pre>
             </div>
           )}
+          <MetaLinks meta={item.meta} />
         </div>
       )}
     </div>
@@ -188,76 +219,11 @@ function buildRenderedContent(
   return sections.join("\n").trim();
 }
 
-function normalizeLegacySteps(rawSteps: unknown): AgentStep[] {
-  if (!Array.isArray(rawSteps)) return [];
-  if (
-    rawSteps.every(
-      (step) =>
-        typeof step === "object" &&
-        step !== null &&
-        "id" in step &&
-        "type" in step &&
-        "content" in step,
-    )
-  ) {
-    return rawSteps as AgentStep[];
+function normalizeTimeline(rawTimeline: unknown): AgentTimelineItem[] {
+  if (Array.isArray(rawTimeline)) {
+    return rawTimeline as AgentTimelineItem[];
   }
-
-  const stepMap = new Map<string, AgentStep>();
-  const orderedStepIds: string[] = [];
-
-  rawSteps.forEach((step) => {
-    const data = step as Record<string, unknown>;
-    const stepId = String(data.step_id || "");
-    if (!stepId) return;
-
-    if (data.event === "agent_thought") {
-      stepMap.set(stepId, {
-        id: stepId,
-        type: "thought",
-        content: String(data.thought || ""),
-        status: "success",
-      });
-      orderedStepIds.push(stepId);
-      return;
-    }
-
-    if (data.event === "tool_start" || data.event === "agent_action") {
-      if (!stepMap.has(stepId)) {
-        orderedStepIds.push(stepId);
-      }
-      stepMap.set(stepId, {
-        id: stepId,
-        type: "tool",
-        content: String(data.tool || ""),
-        toolInput: String(data.tool_input || ""),
-        toolOutput: "",
-        status: "pending",
-      });
-      return;
-    }
-
-    if (data.event === "tool_end" || data.event === "agent_observation") {
-      const existing = stepMap.get(stepId);
-      if (existing) {
-        existing.toolOutput = String(data.observation || "");
-        existing.status = "success";
-      }
-      return;
-    }
-
-    if (data.event === "error") {
-      const existing = stepMap.get(stepId);
-      if (existing) {
-        existing.toolOutput = String(data.error_message || data.message || "");
-        existing.status = "error";
-      }
-    }
-  });
-
-  return orderedStepIds
-    .map((stepId) => stepMap.get(stepId))
-    .filter((step): step is AgentStep => Boolean(step));
+  return [];
 }
 
 function parseStructuredMessage(raw: string | null | undefined) {
@@ -270,7 +236,7 @@ function parseStructuredMessage(raw: string | null | undefined) {
         parsed.summary ||
         parsed.ranked_root_causes?.length ||
         parsed.next_actions?.length ||
-        parsed.steps)
+        parsed.timeline?.length)
     ) {
       return parsed;
     }
@@ -281,7 +247,7 @@ function parseStructuredMessage(raw: string | null | undefined) {
 }
 
 function getAgentRenderContent(message: AgentMessage | StreamAgentMessage): AgentRenderContent {
-  if ("steps" in message && "ranked_root_causes" in message) {
+  if ("timeline" in message && "ranked_root_causes" in message) {
     const content =
       message.content ||
       buildRenderedContent(
@@ -289,13 +255,13 @@ function getAgentRenderContent(message: AgentMessage | StreamAgentMessage): Agen
         message.ranked_root_causes,
         message.next_actions,
       );
-    return { content, steps: message.steps };
+    return { content, timeline: message.timeline };
   }
 
   const structured =
     parseStructuredMessage(message.metadata) || parseStructuredMessage(message.content);
   if (!structured) {
-    return { content: message.content, steps: [] };
+    return { content: message.content, timeline: [] };
   }
 
   const content =
@@ -309,7 +275,7 @@ function getAgentRenderContent(message: AgentMessage | StreamAgentMessage): Agen
 
   return {
     content,
-    steps: normalizeLegacySteps(structured.steps),
+    timeline: normalizeTimeline(structured.timeline),
   };
 }
 
@@ -708,10 +674,10 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
                           width: "100%",
                         }}
                       >
-                        {agentRenderContent?.steps.length ? (
+                        {agentRenderContent?.timeline.length ? (
                           <div style={{ opacity: 0.9 }}>
-                            {agentRenderContent.steps.map((step) => (
-                              <StepBlock key={step.id} step={step} />
+                            {agentRenderContent.timeline.map((item) => (
+                              <TimelineBlock key={item.id} item={item} />
                             ))}
                           </div>
                         ) : null}
@@ -748,10 +714,10 @@ export default function ChatPage({ user, setIsAgentThinking }: ChatPageProps) {
                 style={{ backgroundColor: "#52c41a" }}
               />
               <div style={{ maxWidth: "80%", display: "flex", flexDirection: "column", gap: 8 }}>
-                {renderedDraft?.steps.length ? (
+                {renderedDraft?.timeline.length ? (
                   <div style={{ opacity: 0.9 }}>
-                    {renderedDraft.steps.map((step) => (
-                      <StepBlock key={step.id} step={step} />
+                    {renderedDraft.timeline.map((item) => (
+                      <TimelineBlock key={item.id} item={item} />
                     ))}
                   </div>
                 ) : null}

@@ -87,7 +87,14 @@ class OpsAgent:
 
         t0 = datetime.now(timezone.utc)
         thread_id = req.session_id
-        config = {"configurable": {"thread_id": thread_id}, "callbacks": callbacks}
+        stream_handler = callbacks[0] if callbacks else None
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "stream_handler": stream_handler,
+            },
+            "callbacks": callbacks,
+        }
 
         async with AsyncSqliteSaver.from_conn_string(self.db_path) as saver:
             graph = build_graph().compile(checkpointer=saver, interrupt_before=["wait_for_confirmation"])
