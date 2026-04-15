@@ -3,6 +3,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import jwt
+import bcrypt
+
+# Fix for passlib compatibility with bcrypt 4.x+
+if not hasattr(bcrypt, "__about__"):
+    class _About:
+        __version__ = bcrypt.__version__
+    bcrypt.__about__ = _About()
+
 from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__truncate_error=True)
@@ -13,13 +21,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 24 * 60  # 1 day
 
 def get_password_hash(password: str) -> str:
     # bcrypt 限制密码最大长度为 72 字节
-    if len(password.encode('utf-8')) > 72:
-        password = password[:72]
+    while len(password.encode('utf-8')) > 72:
+        password = password[:-1]
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    if len(plain_password.encode('utf-8')) > 72:
-        plain_password = plain_password[:72]
+    while len(plain_password.encode('utf-8')) > 72:
+        plain_password = plain_password[:-1]
     return pwd_context.verify(plain_password, hashed_password)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):

@@ -69,7 +69,10 @@ def _build_trace(intermediate_steps) -> AgentTrace:
 class OpsAgent:
     def __init__(self):
         self._loki = LokiClient(settings.loki_base_url, settings.loki_tenant_id, settings.request_timeout_s)
-        self.db_path = "checkpoints.sqlite"
+        
+        from pathlib import Path
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        self.db_path = str(base_dir / "checkpoints.sqlite")
 
     async def _run_with_model(
         self,

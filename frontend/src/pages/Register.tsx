@@ -38,9 +38,9 @@ export default function RegisterPage() {
           password: values.password,
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setError(data.error || "注册失败");
+        setError(data.detail || data.message || data.error || "注册失败");
       } else {
         antMessage.success(data.message || "注册成功");
         setTimeout(() => navigate("/login"), 1500);
